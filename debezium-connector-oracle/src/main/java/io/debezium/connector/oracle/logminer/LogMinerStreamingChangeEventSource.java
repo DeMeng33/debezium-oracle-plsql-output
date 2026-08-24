@@ -718,7 +718,8 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         catch (SQLException e) {
             if (e.getErrorCode() == 1291 || e.getMessage().startsWith("ORA-01291")) {
                 if (attempts <= MINING_START_RETRIES) {
-                    LOGGER.warn("Failed to start Oracle LogMiner session due to missing logfile; will rebuild log file list and retry: startScn={}, endScn={}, attempt={}",
+                    LOGGER.warn(
+                            "Failed to start Oracle LogMiner session due to missing logfile; will rebuild log file list and retry: startScn={}, endScn={}, attempt={}",
                             startScn, endScn, attempts, e);
                     return false;
                 }
@@ -816,6 +817,11 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         }
         else {
             if (prevEndScn != null && topScnToMine.compareTo(prevEndScn) <= 0) {
+                if (isPlSqlOutputStrategy()) {
+                    LOGGER.debug("Using Top SCN calculation {} as end SCN for PL/SQL output strategy despite previous end SCN {}. currentScn {}, startScn {}",
+                            topScnToMine, prevEndScn, currentScn, startScn);
+                    return topScnToMine;
+                }
                 LOGGER.debug("Max batch size too small, using current SCN {} as end SCN.", currentScn);
                 return currentScn;
             }
@@ -825,7 +831,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                 return currentScn;
             }
 
-            if (prevEndScn != null) {
+            if (!isPlSqlOutputStrategy() && prevEndScn != null) {
                 final Scn deltaScn = currentScn.subtract(prevEndScn);
                 if (deltaScn.compareTo(Scn.valueOf(connectorConfig.getLogMiningScnGapDetectionGapSizeMin())) > 0) {
                     Optional<OffsetDateTime> prevEndScnTimestamp = connection.getScnToTimestamp(prevEndScn);

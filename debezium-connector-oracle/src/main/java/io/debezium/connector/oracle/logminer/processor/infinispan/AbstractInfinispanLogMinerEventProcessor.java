@@ -30,6 +30,7 @@ import io.debezium.connector.oracle.OraclePartition;
 import io.debezium.connector.oracle.OracleStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.LogMinerQueryBuilder;
+import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.processor.AbstractLogMinerEventProcessor;
@@ -157,14 +158,15 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     }
 
     @Override
-    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
+    protected Scn abandonTransactionsAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn) throws InterruptedException {
         abandonTransactions(getConfig().getLogMiningTransactionRetention());
-        abandonTransactionsMissingFromDatabase(endScn);
+        return abandonTransactionsMissingFromDatabase(partition, endScn);
     }
 
-    private void abandonTransactionsMissingFromDatabase(Scn endScn) {
+    private Scn abandonTransactionsMissingFromDatabase(OraclePartition partition, Scn endScn) throws InterruptedException {
         missingTransactionsCache.keySet().removeIf(transactionId -> !getTransactionCache().containsKey(transactionId));
 
+        Scn terminalScn = Scn.NULL;
         for (String transactionId : new HashSet<>(getTransactionCache().keySet())) {
             final InfinispanTransaction transaction = getTransactionCache().get(transactionId);
             if (transaction == null) {
@@ -181,6 +183,36 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
 
             if (isTransactionActiveInDatabase(transactionId)) {
                 missingTransactionsCache.remove(transactionId);
+                continue;
+            }
+
+            final TerminalTransactionEventLookup terminalEventLookup = findTerminalTransactionEvent(transactionId, transaction.getStartScn(), endScn);
+            if (terminalEventLookup.isFailed()) {
+                continue;
+            }
+            if (terminalEventLookup.isPresent()) {
+                final TerminalTransactionEvent event = terminalEventLookup.getEvent();
+                if (event.getEventType() == EventType.ROLLBACK) {
+                    LOGGER.info(
+                            "PL/SQL output LogMiner found terminal ROLLBACK for cached Infinispan transaction {} missing from V$TRANSACTION; removing rolled back transaction. startScn={}, events={}, rollbackScn={}, endScn={}",
+                            transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), event.getScn(), endScn);
+                    removeEventsWithTransaction(transaction);
+                    getTransactionCache().remove(transactionId);
+                    missingTransactionsCache.remove(transactionId);
+                    abandonedTransactionsCache.remove(transactionId);
+                    getProcessedTransactionsCache().put(transactionId, event.getScn().toString());
+                    metrics.setActiveTransactions(getTransactionCache().size());
+                    metrics.incrementRolledBackTransactions();
+                    metrics.addRolledBackTransactionId(transactionId);
+                    counters.rollbackCount++;
+                    terminalScn = maxScn(terminalScn, event.getScn());
+                    continue;
+                }
+                LOGGER.info(
+                        "PL/SQL output LogMiner found terminal COMMIT for cached Infinispan transaction {} missing from V$TRANSACTION; committing cached transaction. startScn={}, events={}, commitScn={}, endScn={}",
+                        transactionId, transaction.getStartScn(), getTransactionEventCount(transaction), event.getScn(), endScn);
+                handleCommit(partition, createTerminalEventRow(transactionId, event));
+                terminalScn = maxScn(terminalScn, event.getScn());
                 continue;
             }
 
@@ -201,6 +233,7 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
 
         final Scn smallestScn = getTransactionCacheMinimumScn();
         metrics.setOldestScn(smallestScn.isNull() ? Scn.valueOf(-1) : smallestScn);
+        return terminalScn;
     }
 
     private boolean shouldCheckMissingTransaction(Scn endScn, MissingTransactionObservation observation) {
@@ -211,7 +244,7 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     }
 
     private MissingTransactionObservation recordMissingTransactionObservation(String transactionId, InfinispanTransaction transaction,
-                                                                             Scn endScn, MissingTransactionObservation observation) {
+                                                                              Scn endScn, MissingTransactionObservation observation) {
         final Instant now = Instant.now();
         if (observation == null) {
             final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
@@ -269,6 +302,11 @@ public abstract class AbstractInfinispanLogMinerEventProcessor extends AbstractL
     @Override
     protected boolean hasSchemaChangeBeenSeen(LogMinerEventRow row) {
         return getSchemaChangesCache().containsKey(row.getScn().toString());
+    }
+
+    @Override
+    protected OracleConnection getJdbcConnection() {
+        return jdbcConnection;
     }
 
     @Override

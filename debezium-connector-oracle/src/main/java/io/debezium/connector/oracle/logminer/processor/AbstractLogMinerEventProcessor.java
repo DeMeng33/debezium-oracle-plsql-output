@@ -252,6 +252,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
      */
     protected abstract PreparedStatement createQueryStatement() throws SQLException;
 
+    /**
+     * Gets the Oracle connection used by the processor.
+     *
+     * @return the Oracle connection, never {@code null}
+     */
+    protected abstract OracleConnection getJdbcConnection();
+
     private Scn processPlSqlOutput(OraclePartition partition, Scn startScn, Scn endScn) throws SQLException, InterruptedException {
         try (PreparedStatement statement = createQueryStatement()) {
             maybeLogPlSqlOutputPolling(startScn, endScn);
@@ -331,16 +338,19 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(startScn, endScn, activeTransactionsBefore,
                 minTransactionScnBefore, transactionIdsBefore);
 
-        abandonTransactionsAfterEmptyPlSqlOutputWindow(endScn);
+        final Scn terminalScn = abandonTransactionsAfterEmptyPlSqlOutputWindow(partition, endScn);
 
         final int activeTransactionsAfter = getTransactionCache().size();
         if (activeTransactionsAfter == 0) {
-            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, endScn);
+            // If a cached transaction was recovered from its terminal LogMiner row, advance only to that
+            // terminal SCN. The rest of the empty window must be mined again to avoid skipping changes.
+            final Scn advanceScn = terminalScn != null && !terminalScn.isNull() ? terminalScn : endScn;
+            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, advanceScn);
             LOGGER.info(
-                    "PL/SQL output LogMiner abandoned stale transaction(s) after empty window and advanced offset: scnRange=[{}, {}], offsetScn={}, activeTransactionsBefore={}, activeTransactionsAfter={}, minTransactionScnBefore={}, transactionIdsBefore={}, retention={}",
-                    startScn, endScn, offsetContext.getScn(), activeTransactionsBefore, activeTransactionsAfter,
+                    "PL/SQL output LogMiner abandoned or recovered stale transaction(s) after empty window and advanced offset: scnRange=[{}, {}], advancedScn={}, offsetScn={}, activeTransactionsBefore={}, activeTransactionsAfter={}, minTransactionScnBefore={}, transactionIdsBefore={}, retention={}",
+                    startScn, endScn, advanceScn, offsetContext.getScn(), activeTransactionsBefore, activeTransactionsAfter,
                     minTransactionScnBefore, transactionIdsBefore, getConfig().getLogMiningTransactionRetention());
-            return endScn;
+            return advanceScn;
         }
         return null;
     }
@@ -353,8 +363,9 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
     }
 
-    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
+    protected Scn abandonTransactionsAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn) throws InterruptedException {
         abandonTransactions(getConfig().getLogMiningTransactionRetention());
+        return null;
     }
 
     private void maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(Scn startScn, Scn endScn, int activeTransactions,
@@ -608,6 +619,101 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             return sanitized;
         }
         return sanitized.substring(0, PLSQL_OUTPUT_LOG_PREVIEW_LENGTH) + "...";
+    }
+
+    protected TerminalTransactionEventLookup findTerminalTransactionEvent(String transactionId, Scn startScn, Scn endScn) {
+        if (!isHexTransactionId(transactionId) || startScn.isNull() || endScn.isNull()) {
+            LOGGER.warn("Unable to check terminal LogMiner event for transaction {}; invalid xid or SCN range. startScn={}, endScn={}", transactionId, startScn, endScn);
+            metrics.incrementWarningCount();
+            return TerminalTransactionEventLookup.failed();
+        }
+
+        final String block = "DECLARE " +
+                "BEGIN " +
+                "DBMS_OUTPUT.DISABLE; " +
+                "DBMS_OUTPUT.ENABLE(1000000); " +
+                "FOR r IN (" +
+                "SELECT OPERATION_CODE, SCN, TIMESTAMP AS CHANGE_TIME, USERNAME, THREAD# AS THREAD_NUMBER " +
+                "FROM V$LOGMNR_CONTENTS " +
+                "WHERE XID = HEXTORAW(?) " +
+                "AND OPERATION_CODE IN (?, ?) " +
+                "AND SCN >= ? AND SCN <= ? " +
+                "ORDER BY SCN" +
+                ") LOOP " +
+                "DBMS_OUTPUT.PUT_LINE('@TX|' || TO_CHAR(r.OPERATION_CODE) || '|' || TO_CHAR(r.SCN) || '|' || " +
+                "TO_CHAR(r.CHANGE_TIME, 'YYYY-MM-DD HH24:MI:SS') || '|' || NVL(r.USERNAME, '') || '|' || TO_CHAR(NVL(r.THREAD_NUMBER, 0))); " +
+                "EXIT; " +
+                "END LOOP; " +
+                "END;";
+
+        try (CallableStatement statement = getJdbcConnection().connection().prepareCall(block)) {
+            statement.setString(1, transactionId.toUpperCase());
+            statement.setInt(2, EventType.COMMIT.getValue());
+            statement.setInt(3, EventType.ROLLBACK.getValue());
+            statement.setString(4, startScn.toString());
+            statement.setString(5, endScn.toString());
+            statement.execute();
+
+            try (DbmsOutputLineReader reader = new DbmsOutputLineReader(statement)) {
+                final DbmsOutputLine line = reader.readLine();
+                if (line.status != 0 || Strings.isNullOrBlank(line.value)) {
+                    return TerminalTransactionEventLookup.notFound();
+                }
+                return TerminalTransactionEventLookup.found(parseTerminalTransactionEvent(line.value));
+            }
+        }
+        catch (SQLException e) {
+            LOGGER.warn("Unable to check terminal LogMiner event for transaction {}; keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return TerminalTransactionEventLookup.failed();
+        }
+        catch (RuntimeException e) {
+            LOGGER.warn("Oracle JDBC failed while checking terminal LogMiner event for transaction {}; keeping it in cache.", transactionId, e);
+            metrics.incrementWarningCount();
+            return TerminalTransactionEventLookup.failed();
+        }
+    }
+
+    private TerminalTransactionEvent parseTerminalTransactionEvent(String line) {
+        final String[] parts = line.split("\\|", 6);
+        if (parts.length < 6 || !"@TX".equals(parts[0])) {
+            throw new DebeziumException("Bad DBMS_OUTPUT terminal LogMiner event: " + logPreview(line));
+        }
+        return new TerminalTransactionEvent(
+                EventType.from(parseInt(parts[1])),
+                Scn.valueOf(parts[2]),
+                parseTimestamp(parts[3]),
+                nullIfEmpty(parts[4]),
+                parseInt(parts[5]));
+    }
+
+    protected LogMinerEventRow createTerminalEventRow(String transactionId, TerminalTransactionEvent event) {
+        return LogMinerEventRow.fromValues(getConfig().getCatalogName(), event.getScn(), null, event.getEventType().getValue(),
+                event.getChangeTime(), transactionId, null, null, event.getEventType().name(), event.getUserName(), null,
+                false, null, 0, null, 0, event.getThread());
+    }
+
+    protected Scn maxScn(Scn first, Scn second) {
+        if (first == null || first.isNull()) {
+            return second;
+        }
+        if (second == null || second.isNull()) {
+            return first;
+        }
+        return first.compareTo(second) >= 0 ? first : second;
+    }
+
+    private boolean isHexTransactionId(String transactionId) {
+        if (transactionId == null || transactionId.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < transactionId.length(); i++) {
+            final char c = transactionId.charAt(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -1782,6 +1888,76 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     row.info,
                     row.ssn,
                     row.thread);
+        }
+    }
+
+    protected static class TerminalTransactionEvent {
+        private final EventType eventType;
+        private final Scn scn;
+        private final Instant changeTime;
+        private final String userName;
+        private final int thread;
+
+        private TerminalTransactionEvent(EventType eventType, Scn scn, Instant changeTime, String userName, int thread) {
+            this.eventType = eventType;
+            this.scn = scn;
+            this.changeTime = changeTime;
+            this.userName = userName;
+            this.thread = thread;
+        }
+
+        public EventType getEventType() {
+            return eventType;
+        }
+
+        public Scn getScn() {
+            return scn;
+        }
+
+        public Instant getChangeTime() {
+            return changeTime;
+        }
+
+        public String getUserName() {
+            return userName;
+        }
+
+        public int getThread() {
+            return thread;
+        }
+    }
+
+    protected static class TerminalTransactionEventLookup {
+        private final TerminalTransactionEvent event;
+        private final boolean failed;
+
+        private TerminalTransactionEventLookup(TerminalTransactionEvent event, boolean failed) {
+            this.event = event;
+            this.failed = failed;
+        }
+
+        protected static TerminalTransactionEventLookup found(TerminalTransactionEvent event) {
+            return new TerminalTransactionEventLookup(event, false);
+        }
+
+        protected static TerminalTransactionEventLookup notFound() {
+            return new TerminalTransactionEventLookup(null, false);
+        }
+
+        protected static TerminalTransactionEventLookup failed() {
+            return new TerminalTransactionEventLookup(null, true);
+        }
+
+        public boolean isPresent() {
+            return event != null;
+        }
+
+        public boolean isFailed() {
+            return failed;
+        }
+
+        public TerminalTransactionEvent getEvent() {
+            return event;
         }
     }
 
