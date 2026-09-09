@@ -332,6 +332,16 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 19))
             .withDescription("Comma separated list of usernames to exclude from LogMiner query.");
 
+    public static final Field LOG_MINING_TRANSACTION_EXCLUDE_IDS = Field.create("log.mining.transaction.exclude.ids")
+            .withDisplayName("List of transaction IDs to exclude from LogMiner query")
+            .withType(Type.STRING)
+            .withWidth(Width.LONG)
+            .withImportance(Importance.LOW)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 19))
+            .withValidation(OracleConnectorConfig::validateLogMiningTransactionExcludeIds)
+            .withDescription("Comma separated list of 16-character hexadecimal Oracle transaction IDs to exclude from LogMiner. " +
+                    "All changes from excluded transactions are discarded and must be recovered separately.");
+
     public static final Field LOG_MINING_ARCHIVE_DESTINATION_NAME = Field.create("log.mining.archive.destination.name")
             .withDisplayName("Name of the archive log destination to be used for reading archive logs")
             .withType(Type.STRING)
@@ -528,6 +538,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_ARCHIVE_LOG_ONLY_MODE,
                     LOB_ENABLED,
                     LOG_MINING_USERNAME_EXCLUDE_LIST,
+                    LOG_MINING_TRANSACTION_EXCLUDE_IDS,
                     LOG_MINING_ARCHIVE_DESTINATION_NAME,
                     LOG_MINING_BUFFER_TYPE,
                     LOG_MINING_BUFFER_LOCATION,
@@ -594,6 +605,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration archiveLogOnlyScnPollTime;
     private final boolean lobEnabled;
     private final Set<String> logMiningUsernameExcludes;
+    private final Set<String> logMiningTransactionExcludeIds;
     private final String logMiningArchiveDestinationName;
     private final LogMiningBufferType logMiningBufferType;
     private final boolean logMiningBufferDropOnStop;
@@ -641,6 +653,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.logMiningTransactionRetention = Duration.ofHours(config.getInteger(LOG_MINING_TRANSACTION_RETENTION));
         this.archiveLogOnlyMode = config.getBoolean(LOG_MINING_ARCHIVE_LOG_ONLY_MODE);
         this.logMiningUsernameExcludes = Strings.setOf(config.getString(LOG_MINING_USERNAME_EXCLUDE_LIST), String::new);
+        this.logMiningTransactionExcludeIds = Strings.setOf(config.getString(LOG_MINING_TRANSACTION_EXCLUDE_IDS),
+                value -> value.trim().toLowerCase());
         this.logMiningArchiveDestinationName = config.getString(LOG_MINING_ARCHIVE_DESTINATION_NAME);
         this.logMiningBufferType = LogMiningBufferType.parse(config.getString(LOG_MINING_BUFFER_TYPE));
         this.logMiningBufferDropOnStop = config.getBoolean(LOG_MINING_BUFFER_DROP_ON_STOP);
@@ -1467,6 +1481,13 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     }
 
     /**
+     * @return Oracle transaction IDs that must be discarded directly in the LogMiner query
+     */
+    public Set<String> getLogMiningTransactionExcludeIds() {
+        return logMiningTransactionExcludeIds;
+    }
+
+    /**
      * @return name of the archive destination configuration to use
      */
     public String getLogMiningArchiveDestinationName() {
@@ -1604,6 +1625,18 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                         errors++;
                     }
                 }
+            }
+        }
+        return errors;
+    }
+
+    private static int validateLogMiningTransactionExcludeIds(Configuration config, Field field, ValidationOutput problems) {
+        int errors = 0;
+        for (String transactionId : Strings.setOf(config.getString(field), String::new)) {
+            final String normalized = transactionId.trim();
+            if (!normalized.matches("(?i)[0-9a-f]{16}")) {
+                problems.accept(field, transactionId, "Must be a 16-character hexadecimal Oracle transaction ID");
+                errors++;
             }
         }
         return errors;

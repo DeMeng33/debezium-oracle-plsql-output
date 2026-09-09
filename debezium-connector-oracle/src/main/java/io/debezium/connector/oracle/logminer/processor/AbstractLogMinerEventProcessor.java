@@ -17,12 +17,17 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -31,8 +36,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
-import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnection.NonRelationalTableException;
+import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
 import io.debezium.connector.oracle.OracleOffsetContext;
@@ -88,6 +93,8 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private static final int[] PLSQL_OUTPUT_GET_LINES_LINE_LENGTHS = { 8000, 4000 };
     private static final int PLSQL_OUTPUT_LOG_PREVIEW_LENGTH = 512;
     private static final int PLSQL_OUTPUT_SAMPLE_LIMIT = 5;
+    private static final int PLSQL_OUTPUT_EVENT_INSPECTION_LIMIT = 10_000;
+    private static final int PLSQL_OUTPUT_TABLE_DIAGNOSTIC_LIMIT = 10;
 
     private final ChangeEventSourceContext context;
     private final OracleConnectorConfig connectorConfig;
@@ -107,6 +114,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private boolean sequenceUnavailable = false;
     private Instant lastPlSqlOutputActivityLogTime = Instant.EPOCH;
     private long plSqlOutputEmptyBatchCount;
+    private boolean logFileListChanged;
 
     public AbstractLogMinerEventProcessor(ChangeEventSourceContext context,
                                           OracleConnectorConfig connectorConfig,
@@ -193,6 +201,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
      */
     protected abstract int getTransactionEventCount(T transaction);
 
+    /**
+     * Returns the total number of events currently stored by the transaction cache.
+     *
+     * @return the number of cached events
+     */
+    protected abstract long getTransactionCacheEventCount();
+
     // todo: can this be removed in favor of a single implementation?
     protected boolean isTrxIdRawValue() {
         return true;
@@ -201,6 +216,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     @Override
     public Scn process(OraclePartition partition, Scn startScn, Scn endScn) throws SQLException, InterruptedException {
         counters.reset();
+        logFileListChanged = false;
 
         if (OracleConnectorConfig.LogMiningStrategy.PLSQL_OUTPUT.equals(getConfig().getLogMiningStrategy())) {
             return processPlSqlOutput(partition, startScn, endScn);
@@ -244,6 +260,11 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
     }
 
+    @Override
+    public boolean isLogFileListChanged() {
+        return logFileListChanged;
+    }
+
     /**
      * Create the JDBC query that will be used to fetch the mining result set.
      *
@@ -252,14 +273,12 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
      */
     protected abstract PreparedStatement createQueryStatement() throws SQLException;
 
-    /**
-     * Gets the Oracle connection used by the processor.
-     *
-     * @return the Oracle connection, never {@code null}
-     */
-    protected abstract OracleConnection getJdbcConnection();
-
     private Scn processPlSqlOutput(OraclePartition partition, Scn startScn, Scn endScn) throws SQLException, InterruptedException {
+        return processPlSqlOutput(partition, startScn, endScn, null);
+    }
+
+    private Scn processPlSqlOutput(OraclePartition partition, Scn startScn, Scn endScn, LogMinerDictionaryRecovery.Plan verifiedFilteredWindow)
+            throws SQLException, InterruptedException {
         try (PreparedStatement statement = createQueryStatement()) {
             maybeLogPlSqlOutputPolling(startScn, endScn);
             LOGGER.debug("Fetching PL/SQL output results for SCN [{}, {}]", startScn, endScn);
@@ -270,7 +289,16 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             LOGGER.debug("PL/SQL output LogMiner executing DBMS_OUTPUT query block: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, activeTransactions={}",
                     startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn(),
                     metrics.getNumberOfActiveTransactions());
-            statement.execute();
+            try {
+                statement.execute();
+            }
+            catch (SQLException e) {
+                if (verifiedFilteredWindow == null && (e.getErrorCode() == 100 || e.getErrorCode() == 1403)) {
+                    LOGGER.warn("Starting raw verification: reason=ORA-01403, scnRange=({}, {}], error={}", startScn, endScn, e.getMessage());
+                    return recoverPlSqlOutputWindow(partition, statement, startScn, endScn, e);
+                }
+                throw e;
+            }
             Duration queryDuration = Duration.between(queryStart, Instant.now());
             metrics.setLastDurationOfBatchCapturing(queryDuration);
             LOGGER.debug("PL/SQL output LogMiner DBMS_OUTPUT query block finished in {} ms: scnRange=[{}, {}]",
@@ -313,92 +341,238 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
 
             metrics.addProcessedRows(counters.rows - rowsBefore);
             if (readStats.outputRows == 0 && !readStats.truncated) {
-                final Scn advancedScn = advanceAfterEmptyPlSqlOutputWindow(partition, startScn, endScn);
-                if (advancedScn != null) {
-                    return advancedScn;
+                if (verifiedFilteredWindow != null) {
+                    if (verifiedFilteredWindow.emptyReplayRejection != null) {
+                        throw new DebeziumException("Online LogMiner retry still returned zero rows; " + verifiedFilteredWindow.emptyReplayRejection
+                                + "; refusing offset advancement for (" + startScn + ", " + endScn + "]");
+                    }
+                    return advanceVerifiedPlSqlOutputWindow(partition, startScn, endScn, 0);
                 }
+                LOGGER.warn("Starting raw verification: reason=ONLINE_ZERO_ROWS, scnRange=({}, {}], outputRows=0", startScn, endScn);
+                return recoverPlSqlOutputWindow(partition, statement, startScn, endScn, null);
             }
             final Scn effectiveEndScn = readStats.getEffectiveEndScn(endScn);
             return calculateNewStartScn(effectiveEndScn, offsetContext.getCommitScn().getMaxCommittedScn());
         }
     }
 
-    private Scn advanceAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn startScn, Scn endScn)
-            throws InterruptedException {
-        final int activeTransactionsBefore = getTransactionCache().size();
-        if (activeTransactionsBefore == 0) {
-            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, endScn);
-            LOGGER.info("PL/SQL output LogMiner advanced empty window: scnRange=[{}, {}], offsetScn={}, activeTransactions=0",
-                    startScn, endScn, offsetContext.getScn());
-            return endScn;
+    private Scn recoverPlSqlOutputWindow(OraclePartition partition, PreparedStatement statement, Scn startScn, Scn endScn, SQLException trigger)
+            throws SQLException, InterruptedException {
+        final String recoveryId = UUID.randomUUID().toString();
+        final LogMinerDictionaryRecovery.Plan plan;
+        LOGGER.info("LOGMINER_DIAGNOSIS_STARTED recoveryId={}, reason={}, partition={}, catalog={}, pdb={}, range=({}, {}], offsetScn={}, "
+                + "commitScn={}, activeTransactions={}, execution=single-thread-two-connections, dictionaryScope=ROOT_ONLY",
+                recoveryId, trigger == null ? "ONLINE_ZERO_ROWS" : "ORA_01403", partition, getConfig().getCatalogName(), getConfig().getPdbName(), startScn, endScn,
+                offsetContext.getScn(), offsetContext.getCommitScn(), getTransactionCache().size());
+        if (trigger != null) {
+            LOGGER.error("LOGMINER_ONLINE_QUERY_ERROR recoveryId={}, range=({}, {}], sqlState={}, oracleErrorCode={}",
+                    recoveryId, startScn, endScn, trigger.getSQLState(), trigger.getErrorCode(), trigger);
         }
-
-        final Scn minTransactionScnBefore = getTransactionCacheMinimumScn();
-        final String transactionIdsBefore = describeCachedTransactionIds();
-        maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(startScn, endScn, activeTransactionsBefore,
-                minTransactionScnBefore, transactionIdsBefore);
-
-        final Scn terminalScn = abandonTransactionsAfterEmptyPlSqlOutputWindow(partition, endScn);
-
-        final int activeTransactionsAfter = getTransactionCache().size();
-        if (activeTransactionsAfter == 0) {
-            // If a cached transaction was recovered from its terminal LogMiner row, advance only to that
-            // terminal SCN. The rest of the empty window must be mined again to avoid skipping changes.
-            final Scn advanceScn = terminalScn != null && !terminalScn.isNull() ? terminalScn : endScn;
-            advanceOffsetAfterEmptyPlSqlOutputWindow(partition, advanceScn);
-            LOGGER.info(
-                    "PL/SQL output LogMiner abandoned or recovered stale transaction(s) after empty window and advanced offset: scnRange=[{}, {}], advancedScn={}, offsetScn={}, activeTransactionsBefore={}, activeTransactionsAfter={}, minTransactionScnBefore={}, transactionIdsBefore={}, retention={}",
-                    startScn, endScn, advanceScn, offsetContext.getScn(), activeTransactionsBefore, activeTransactionsAfter,
-                    minTransactionScnBefore, transactionIdsBefore, getConfig().getLogMiningTransactionRetention());
-            return advanceScn;
+        try (OracleConnection diagnostic = createDiagnosticConnection()) {
+            diagnostic.setAutoCommit(false);
+            if (!Strings.isNullOrEmpty(getConfig().getPdbName())) {
+                diagnostic.resetSessionToCdb();
+            }
+            try (LogMinerDictionaryRecovery recovery = new LogMinerDictionaryRecovery(
+                    statement.getConnection(), diagnostic.connection(), getConfig(), context::isRunning, recoveryId)) {
+                plan = recovery.verify(startScn, endScn);
+                logFileListChanged |= recovery.isOnlineLogFileListChanged();
+            }
         }
-        return null;
+        catch (SQLException | RuntimeException | InterruptedException e) {
+            LOGGER.error("LOGMINER_RECOVERY_NOT_APPLIED recoveryId={}, range=({}, {}], offsetScn={}, commitScn={}, activeTransactions={}, "
+                    + "noMetadataBoundariesApplied=true, noWindowDiscarded=true",
+                    recoveryId, startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn(), getTransactionCache().size(), e);
+            throw e;
+        }
+        if (!context.isRunning()) {
+            throw new InterruptedException("LogMiner stopped before verified metadata could be applied");
+        }
+        if (plan.replayOnline) {
+            LOGGER.info("Replaying safe online LogMiner interval: scnRange=({}, {}], originalEndScn={}", startScn, plan.end, endScn);
+            return processPlSqlOutput(partition, startScn, plan.end, plan.end.equals(endScn) ? plan : null);
+        }
+        if (plan.audit == null) {
+            return advanceVerifiedPlSqlOutputWindow(partition, startScn, plan.end, 0);
+        }
+        final Scn offsetBefore = offsetContext.getScn();
+        final String commitBefore = offsetContext.getCommitScn().toString();
+        LOGGER.error("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId={}, triggerReason={}, partition={}, catalog={}, pdb={}, details={}, "
+                + "offsetBefore={}, commitBefore={}, activeTransactions={}, cachedEvents={}, diagnosticConnectionClosed=true, "
+                + "businessDmlDiscarded=false, transactionBoundariesPreserved=true",
+                recoveryId, trigger == null ? "ONLINE_ZERO_ROWS" : "ORA_01403", partition, getConfig().getCatalogName(), getConfig().getPdbName(), plan.audit.summary,
+                offsetBefore, commitBefore, getTransactionCache().size(), getTransactionCacheEventCount());
+        for (String record : plan.audit.records) {
+            LOGGER.error("LOGMINER_SYS_REDO_RECORD recoveryId={}, phase=PREPARED, {}", recoveryId, record);
+        }
+        for (T transaction : getTransactionCache().values()) {
+            LOGGER.error("LOGMINER_SYS_REDO_TRANSACTION recoveryId={}, retainedTransaction={}", recoveryId, describeTransactionForDiagnostics(transaction));
+        }
+        int handledBoundaries = 0;
+        try {
+            for (LogMinerEventRow boundary : plan.boundaries) {
+                if (!context.isRunning() || Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("LogMiner stopped before metadata transaction boundary");
+                }
+                final boolean cachedBefore = getTransactionCache().containsKey(boundary.getTransactionId());
+                processRow(partition, boundary);
+                if (!context.isRunning() || Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("LogMiner stopped during metadata transaction boundary");
+                }
+                handledBoundaries++;
+                LOGGER.error("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId={}, scn={}, operation={}, xid={}, redoThread={}, "
+                        + "cachedBefore={}, commitScnAfter={}",
+                        recoveryId, boundary.getScn(), boundary.getEventType(), boundary.getTransactionId(), boundary.getThread(),
+                        cachedBefore, offsetContext.getCommitScn());
+            }
+            final Scn next = advanceVerifiedPlSqlOutputWindow(partition, startScn, plan.end, handledBoundaries);
+            LOGGER.error("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId={}, details={}, nextStartScn={}, offsetBefore={}, offsetAfter={}, "
+                    + "commitBefore={}, commitAfter={}, handledBoundaries={}, activeTransactions={}, heartbeatEnqueued=true, "
+                    + "durableCheckpointNotConfirmed=true",
+                    recoveryId, plan.audit.summary, next, offsetBefore, offsetContext.getScn(), commitBefore,
+                    offsetContext.getCommitScn(), handledBoundaries, getTransactionCache().size());
+            return next;
+        }
+        catch (SQLException | RuntimeException | InterruptedException e) {
+            LOGGER.error("LOGMINER_SYS_REDO_APPLY_FAILED recoveryId={}, details={}, handledBoundaries={}, offsetBefore={}, offsetNow={}, "
+                    + "commitBefore={}, commitNow={}, partialDispatchPossible=true, durableCheckpointNotConfirmed=true",
+                    recoveryId, plan.audit.summary, handledBoundaries, offsetBefore, offsetContext.getScn(), commitBefore, offsetContext.getCommitScn(), e);
+            throw e;
+        }
     }
 
-    private void advanceOffsetAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn)
+    protected OracleConnection createDiagnosticConnection() {
+        return new OracleConnection(getConfig().getJdbcConfig(), () -> getClass().getClassLoader(), false);
+    }
+
+    private Scn advanceVerifiedPlSqlOutputWindow(OraclePartition partition, Scn startScn, Scn endScn, int boundaryCount)
             throws InterruptedException {
-        offsetContext.setScn(endScn);
-        metrics.setOldestScn(endScn);
-        metrics.setOffsetScn(endScn);
+        // Keep active transactions, even when V$TRANSACTION no longer contains them. Their
+        // commits can still be ahead of the mining frontier. A verified gap never abandons them.
+        lastProcessedScn = endScn;
+        final Scn minimum = getTransactionCacheMinimumScn();
+        final Scn restartScn = minimum.isNull() ? endScn : minimum.subtract(Scn.ONE);
+        offsetContext.setScn(restartScn);
+        metrics.setOldestScn(restartScn);
+        metrics.setOffsetScn(restartScn);
         dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
+        LOGGER.info("Applied verified LogMiner metadata window: scnRange=({}, {}], commitRollbackRows={}, nextStartScn={}, offsetScn={}, activeTransactions={}",
+                startScn, endScn, boundaryCount, endScn, restartScn, getTransactionCache().size());
+        return getConfig().isLobEnabled() ? restartScn : endScn;
     }
 
-    protected Scn abandonTransactionsAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn) throws InterruptedException {
+    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
         abandonTransactions(getConfig().getLogMiningTransactionRetention());
-        return null;
     }
 
-    private void maybeLogEmptyPlSqlOutputWindowWithActiveTransactions(Scn startScn, Scn endScn, int activeTransactions,
-                                                                      Scn minTransactionScn, String transactionIds) {
-        final Instant now = Instant.now();
-        if (Duration.between(lastPlSqlOutputActivityLogTime, now).compareTo(PLSQL_OUTPUT_IDLE_LOG_INTERVAL) >= 0) {
-            LOGGER.info(
-                    "PL/SQL output LogMiner empty window with active transactions: scnRange=[{}, {}], offsetScn={}, offsetCommitScn={}, activeTransactions={}, minTransactionScn={}, transactionIds={}, retention={}, emptyBatchesSinceLastLog={}",
-                    startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn(), activeTransactions,
-                    minTransactionScn, transactionIds, getConfig().getLogMiningTransactionRetention(), plSqlOutputEmptyBatchCount);
-            lastPlSqlOutputActivityLogTime = now;
-            plSqlOutputEmptyBatchCount = 0;
+    protected String describeTransactionForDiagnostics(T transaction) {
+        if (transaction == null) {
+            return "<missing>";
         }
+
+        int inspectedEvents = 0;
+        boolean inspectionTruncated = false;
+        Scn firstEventScn = Scn.NULL;
+        Scn lastEventScn = Scn.NULL;
+        LogMinerEvent lastEvent = null;
+        final Map<EventType, Integer> operationCounts = new EnumMap<>(EventType.class);
+        final Set<String> tables = new LinkedHashSet<>();
+        boolean tablesTruncated = false;
+        String inspectionError = null;
+        try {
+            final Iterator<LogMinerEvent> iterator = getTransactionEventIterator(transaction);
+            while (iterator.hasNext()) {
+                if (inspectedEvents == PLSQL_OUTPUT_EVENT_INSPECTION_LIMIT) {
+                    inspectionTruncated = true;
+                    break;
+                }
+                final LogMinerEvent event = iterator.next();
+                inspectedEvents++;
+                if (firstEventScn.isNull() || event.getScn().compareTo(firstEventScn) < 0) {
+                    firstEventScn = event.getScn();
+                }
+                if (lastEventScn.isNull() || event.getScn().compareTo(lastEventScn) >= 0) {
+                    lastEventScn = event.getScn();
+                    lastEvent = event;
+                }
+                operationCounts.merge(event.getEventType(), 1, Integer::sum);
+                if (event.getTableId() != null) {
+                    final String tableId = event.getTableId().identifier();
+                    if (tables.size() < PLSQL_OUTPUT_TABLE_DIAGNOSTIC_LIMIT || tables.contains(tableId)) {
+                        tables.add(tableId);
+                    }
+                    else {
+                        tablesTruncated = true;
+                    }
+                }
+            }
+        }
+        catch (RuntimeException e) {
+            inspectionError = e.getClass().getSimpleName() + ":" + e.getMessage();
+        }
+
+        return "{transactionId=" + transaction.getTransactionId() +
+                ", startScn=" + transaction.getStartScn() +
+                ", changeTime=" + transaction.getChangeTime() +
+                ", userName=" + transaction.getUserName() +
+                ", eventCursor=" + transaction.getNumberOfEvents() +
+                ", inspectedCachedEvents=" + inspectedEvents +
+                ", inspectionTruncated=" + inspectionTruncated +
+                ", inspectedEventScnRange=[" + firstEventScn + ", " + lastEventScn + "]" +
+                ", lastInspectedEvent=" + describeEventForDiagnostics(lastEvent) +
+                ", inspectedOperations=" + operationCounts +
+                ", tables=" + tables +
+                ", tablesTruncated=" + tablesTruncated +
+                (inspectionError == null ? "" : ", inspectionError=" + inspectionError) +
+                '}';
     }
 
-    private String describeCachedTransactionIds() {
-        if (getTransactionCache().isEmpty()) {
-            return "[]";
+    protected String describeTransactionCacheState() {
+        return captureTransactionCacheSnapshot().toString();
+    }
+
+    private String describeEventForDiagnostics(LogMinerEvent event) {
+        if (event == null) {
+            return "<none>";
         }
-        final StringBuilder result = new StringBuilder("[");
-        int count = 0;
-        for (String transactionId : getTransactionCache().keySet()) {
-            if (count > 0) {
-                result.append(", ");
+        return "{scn=" + event.getScn() +
+                ", operation=" + event.getEventType() +
+                ", table=" + event.getTableId() +
+                ", rowId=" + event.getRowId() +
+                '}';
+    }
+
+    private TransactionCacheSnapshot captureTransactionCacheSnapshot() {
+        int transactions = 0;
+        long cachedEventsTotal = -1;
+        long eventCursorTotal = 0;
+        Scn minStartScn = Scn.NULL;
+        Scn maxStartScn = Scn.NULL;
+        String error = null;
+        try {
+            for (T transaction : getTransactionCache().values()) {
+                transactions++;
+                eventCursorTotal += transaction.getNumberOfEvents();
+                if (minStartScn.isNull() || transaction.getStartScn().compareTo(minStartScn) < 0) {
+                    minStartScn = transaction.getStartScn();
+                }
+                if (maxStartScn.isNull() || transaction.getStartScn().compareTo(maxStartScn) > 0) {
+                    maxStartScn = transaction.getStartScn();
+                }
             }
-            if (count == PLSQL_OUTPUT_SAMPLE_LIMIT) {
-                result.append("... total=").append(getTransactionCache().size());
-                break;
-            }
-            result.append(transactionId);
-            count++;
+            cachedEventsTotal = getTransactionCacheEventCount();
         }
-        return result.append(']').toString();
+        catch (RuntimeException e) {
+            error = diagnosticError(e);
+        }
+        return new TransactionCacheSnapshot(transactions, cachedEventsTotal, eventCursorTotal, minStartScn, maxStartScn, error);
+    }
+
+    private String diagnosticError(RuntimeException e) {
+        final String message = e.getMessage();
+        return "<diagnosticError=" + e.getClass().getSimpleName() +
+                (Strings.isNullOrBlank(message) ? "" : ":" + logPreview(message)) +
+                ">";
     }
 
     private void maybeLogPlSqlOutputPolling(Scn startScn, Scn endScn) {
@@ -435,10 +609,9 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
     private PlSqlOutputReadStats processPlSqlOutputRows(OraclePartition partition, PreparedStatement queryStatement, Scn startScn, Scn endScn)
             throws SQLException, InterruptedException {
         PlSqlOutputReadStats stats = new PlSqlOutputReadStats();
+        List<LogMinerEventRow> completedRows = new ArrayList<>();
         try (DbmsOutputLineReader reader = new DbmsOutputLineReader(queryStatement)) {
             PlSqlOutputRowBuilder current = null;
-            Set<String> newTransactionsInBatch = new HashSet<>();
-            Set<String> replayResetTransactions = new HashSet<>();
             Instant lastProgressLogTime = Instant.now();
             while (context.isRunning()) {
                 DbmsOutputLine header = reader.readLine();
@@ -494,8 +667,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
 
                 if (row.csf == 0) {
                     LogMinerEventRow eventRow = current.build(getConfig().getCatalogName());
-                    resetPlSqlOutputTransactionReplayCursor(eventRow, newTransactionsInBatch, replayResetTransactions);
-                    processRow(partition, eventRow);
+                    completedRows.add(eventRow);
                     stats.completedRows++;
                     current = null;
                 }
@@ -515,6 +687,20 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                         "The SQL_REDO continuation was not fully read; refusing to advance the mining offset. lastRow=" +
                         stats.describeLastRow());
             }
+        }
+        if (!context.isRunning()) {
+            throw new InterruptedException("LogMiner stopped while reading DBMS_OUTPUT; refusing offset advancement");
+        }
+        if (!stats.endMarkerSeen) {
+            throw new DebeziumException("Missing DBMS_OUTPUT LogMiner completion marker; refusing offset advancement for ("
+                    + startScn + ", " + endScn + "]");
+        }
+        // Validate the entire bounded transport batch before changing transaction/offset state.
+        Set<String> newTransactionsInBatch = new HashSet<>();
+        Set<String> replayResetTransactions = new HashSet<>();
+        for (LogMinerEventRow eventRow : completedRows) {
+            resetPlSqlOutputTransactionReplayCursor(eventRow, newTransactionsInBatch, replayResetTransactions);
+            processRow(partition, eventRow);
         }
         return stats;
     }
@@ -580,17 +766,28 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
 
     private void parsePlSqlOutputEnd(String line, PlSqlOutputReadStats stats, Scn startScn, Scn endScn) {
         final String[] parts = line.split("\\|", 3);
-        if (parts.length != 3 || !"truncated".equals(parts[2])) {
+        if (parts.length != 3 || !("truncated".equals(parts[2]) || "complete".equals(parts[2]))) {
             throw new DebeziumException("Bad DBMS_OUTPUT LogMiner end marker: " + logPreview(line));
         }
         if (Strings.isNullOrBlank(parts[1])) {
-            throw new DebeziumException("DBMS_OUTPUT LogMiner end marker truncated before any row was completed.");
+            throw new DebeziumException("DBMS_OUTPUT LogMiner end marker missing SCN.");
         }
         final Scn effectiveEndScn = Scn.valueOf(parts[1]);
+        if ("complete".equals(parts[2])) {
+            if (!effectiveEndScn.equals(endScn)) {
+                throw new DebeziumException("DBMS_OUTPUT LogMiner completion SCN does not match window end: " + line);
+            }
+            stats.endMarkerSeen = true;
+            return;
+        }
+        if (!effectiveEndScn.equals(stats.lastScn)) {
+            throw new DebeziumException("DBMS_OUTPUT LogMiner truncation marker does not match last complete SCN: " + line);
+        }
         if (effectiveEndScn.compareTo(startScn) <= 0 || effectiveEndScn.compareTo(endScn) > 0) {
             throw new DebeziumException("DBMS_OUTPUT LogMiner end marker SCN is outside the mining window: markerScn=" +
                     effectiveEndScn + ", scnRange=[" + startScn + ", " + endScn + "]");
         }
+        stats.endMarkerSeen = true;
         stats.truncated = true;
         stats.effectiveEndScn = effectiveEndScn;
     }
@@ -619,101 +816,6 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             return sanitized;
         }
         return sanitized.substring(0, PLSQL_OUTPUT_LOG_PREVIEW_LENGTH) + "...";
-    }
-
-    protected TerminalTransactionEventLookup findTerminalTransactionEvent(String transactionId, Scn startScn, Scn endScn) {
-        if (!isHexTransactionId(transactionId) || startScn.isNull() || endScn.isNull()) {
-            LOGGER.warn("Unable to check terminal LogMiner event for transaction {}; invalid xid or SCN range. startScn={}, endScn={}", transactionId, startScn, endScn);
-            metrics.incrementWarningCount();
-            return TerminalTransactionEventLookup.failed();
-        }
-
-        final String block = "DECLARE " +
-                "BEGIN " +
-                "DBMS_OUTPUT.DISABLE; " +
-                "DBMS_OUTPUT.ENABLE(1000000); " +
-                "FOR r IN (" +
-                "SELECT OPERATION_CODE, SCN, TIMESTAMP AS CHANGE_TIME, USERNAME, THREAD# AS THREAD_NUMBER " +
-                "FROM V$LOGMNR_CONTENTS " +
-                "WHERE XID = HEXTORAW(?) " +
-                "AND OPERATION_CODE IN (?, ?) " +
-                "AND SCN >= ? AND SCN <= ? " +
-                "ORDER BY SCN" +
-                ") LOOP " +
-                "DBMS_OUTPUT.PUT_LINE('@TX|' || TO_CHAR(r.OPERATION_CODE) || '|' || TO_CHAR(r.SCN) || '|' || " +
-                "TO_CHAR(r.CHANGE_TIME, 'YYYY-MM-DD HH24:MI:SS') || '|' || NVL(r.USERNAME, '') || '|' || TO_CHAR(NVL(r.THREAD_NUMBER, 0))); " +
-                "EXIT; " +
-                "END LOOP; " +
-                "END;";
-
-        try (CallableStatement statement = getJdbcConnection().connection().prepareCall(block)) {
-            statement.setString(1, transactionId.toUpperCase());
-            statement.setInt(2, EventType.COMMIT.getValue());
-            statement.setInt(3, EventType.ROLLBACK.getValue());
-            statement.setString(4, startScn.toString());
-            statement.setString(5, endScn.toString());
-            statement.execute();
-
-            try (DbmsOutputLineReader reader = new DbmsOutputLineReader(statement)) {
-                final DbmsOutputLine line = reader.readLine();
-                if (line.status != 0 || Strings.isNullOrBlank(line.value)) {
-                    return TerminalTransactionEventLookup.notFound();
-                }
-                return TerminalTransactionEventLookup.found(parseTerminalTransactionEvent(line.value));
-            }
-        }
-        catch (SQLException e) {
-            LOGGER.warn("Unable to check terminal LogMiner event for transaction {}; keeping it in cache.", transactionId, e);
-            metrics.incrementWarningCount();
-            return TerminalTransactionEventLookup.failed();
-        }
-        catch (RuntimeException e) {
-            LOGGER.warn("Oracle JDBC failed while checking terminal LogMiner event for transaction {}; keeping it in cache.", transactionId, e);
-            metrics.incrementWarningCount();
-            return TerminalTransactionEventLookup.failed();
-        }
-    }
-
-    private TerminalTransactionEvent parseTerminalTransactionEvent(String line) {
-        final String[] parts = line.split("\\|", 6);
-        if (parts.length < 6 || !"@TX".equals(parts[0])) {
-            throw new DebeziumException("Bad DBMS_OUTPUT terminal LogMiner event: " + logPreview(line));
-        }
-        return new TerminalTransactionEvent(
-                EventType.from(parseInt(parts[1])),
-                Scn.valueOf(parts[2]),
-                parseTimestamp(parts[3]),
-                nullIfEmpty(parts[4]),
-                parseInt(parts[5]));
-    }
-
-    protected LogMinerEventRow createTerminalEventRow(String transactionId, TerminalTransactionEvent event) {
-        return LogMinerEventRow.fromValues(getConfig().getCatalogName(), event.getScn(), null, event.getEventType().getValue(),
-                event.getChangeTime(), transactionId, null, null, event.getEventType().name(), event.getUserName(), null,
-                false, null, 0, null, 0, event.getThread());
-    }
-
-    protected Scn maxScn(Scn first, Scn second) {
-        if (first == null || first.isNull()) {
-            return second;
-        }
-        if (second == null || second.isNull()) {
-            return first;
-        }
-        return first.compareTo(second) >= 0 ? first : second;
-    }
-
-    private boolean isHexTransactionId(String transactionId) {
-        if (transactionId == null || transactionId.isEmpty()) {
-            return false;
-        }
-        for (int i = 0; i < transactionId.length(); i++) {
-            final char c = transactionId.charAt(i);
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-                return false;
-            }
-        }
-        return true;
     }
 
     /**
@@ -1666,7 +1768,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             Object output = batchStatement.getPlsqlIndexTable(1);
             int fetched = batchStatement.getInt(2);
             fetchCalls++;
-            if (fetched <= 0 || output == null) {
+            if (fetched < 0 || fetched > PLSQL_OUTPUT_GET_LINES_BATCH_SIZE || (fetched > 0 && output == null)) {
+                throw new DebeziumException("Invalid DBMS_OUTPUT.GET_LINES result: fetched=" + fetched);
+            }
+            if (fetched == 0) {
                 exhausted = true;
                 count = 0;
                 index = 0;
@@ -1674,7 +1779,10 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
             }
 
             String[] fetchedLines = (String[]) output;
-            count = Math.min(fetched, fetchedLines.length);
+            if (fetched > fetchedLines.length) {
+                throw new DebeziumException("Incomplete DBMS_OUTPUT.GET_LINES array: expected=" + fetched + ", actual=" + fetchedLines.length);
+            }
+            count = fetched;
             System.arraycopy(fetchedLines, 0, lines, 0, count);
             index = 0;
             this.fetchedLines += count;
@@ -1741,6 +1849,35 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
     }
 
+    private static class TransactionCacheSnapshot {
+        private final int transactions;
+        private final long cachedEventsTotal;
+        private final long eventCursorTotal;
+        private final Scn minStartScn;
+        private final Scn maxStartScn;
+        private final String diagnosticError;
+
+        private TransactionCacheSnapshot(int transactions, long cachedEventsTotal, long eventCursorTotal, Scn minStartScn, Scn maxStartScn,
+                                         String diagnosticError) {
+            this.transactions = transactions;
+            this.cachedEventsTotal = cachedEventsTotal;
+            this.eventCursorTotal = eventCursorTotal;
+            this.minStartScn = minStartScn;
+            this.maxStartScn = maxStartScn;
+            this.diagnosticError = diagnosticError;
+        }
+
+        @Override
+        public String toString() {
+            return "{transactions=" + transactions +
+                    ", cachedEventsTotal=" + cachedEventsTotal +
+                    ", eventCursorTotal=" + eventCursorTotal +
+                    ", startScnRange=[" + minStartScn + ", " + maxStartScn + "]" +
+                    (diagnosticError == null ? "" : ", diagnosticError=" + diagnosticError) +
+                    '}';
+        }
+    }
+
     private static class PlSqlOutputReadStats {
         private long outputLines;
         private long outputFetches;
@@ -1748,6 +1885,7 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         private long completedRows;
         private boolean flushedPartialRow;
         private boolean truncated;
+        private boolean endMarkerSeen;
         private Scn effectiveEndScn;
         private Scn lastScn = Scn.NULL;
         private int lastOperationCode;
@@ -1888,76 +2026,6 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     row.info,
                     row.ssn,
                     row.thread);
-        }
-    }
-
-    protected static class TerminalTransactionEvent {
-        private final EventType eventType;
-        private final Scn scn;
-        private final Instant changeTime;
-        private final String userName;
-        private final int thread;
-
-        private TerminalTransactionEvent(EventType eventType, Scn scn, Instant changeTime, String userName, int thread) {
-            this.eventType = eventType;
-            this.scn = scn;
-            this.changeTime = changeTime;
-            this.userName = userName;
-            this.thread = thread;
-        }
-
-        public EventType getEventType() {
-            return eventType;
-        }
-
-        public Scn getScn() {
-            return scn;
-        }
-
-        public Instant getChangeTime() {
-            return changeTime;
-        }
-
-        public String getUserName() {
-            return userName;
-        }
-
-        public int getThread() {
-            return thread;
-        }
-    }
-
-    protected static class TerminalTransactionEventLookup {
-        private final TerminalTransactionEvent event;
-        private final boolean failed;
-
-        private TerminalTransactionEventLookup(TerminalTransactionEvent event, boolean failed) {
-            this.event = event;
-            this.failed = failed;
-        }
-
-        protected static TerminalTransactionEventLookup found(TerminalTransactionEvent event) {
-            return new TerminalTransactionEventLookup(event, false);
-        }
-
-        protected static TerminalTransactionEventLookup notFound() {
-            return new TerminalTransactionEventLookup(null, false);
-        }
-
-        protected static TerminalTransactionEventLookup failed() {
-            return new TerminalTransactionEventLookup(null, true);
-        }
-
-        public boolean isPresent() {
-            return event != null;
-        }
-
-        public boolean isFailed() {
-            return failed;
-        }
-
-        public TerminalTransactionEvent getEvent() {
-            return event;
         }
     }
 

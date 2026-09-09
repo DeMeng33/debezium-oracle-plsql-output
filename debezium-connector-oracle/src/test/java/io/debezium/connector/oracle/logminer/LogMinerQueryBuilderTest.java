@@ -150,6 +150,27 @@ public class LogMinerQueryBuilderTest {
         assertThat(result.contains("SELECT ROWNUM AS LOGMNR_ROW_SEQUENCE, SCN, SQL_REDO")).isTrue();
         assertThat(result.contains("ORDER BY q.SCN, q.LOGMNR_ROW_SEQUENCE")).isTrue();
         assertThat(result.contains("ORDER BY q.SCN, q.RS_ID, q.SSN")).isFalse();
+        assertThat(result.contains("l_window_start_scn NUMBER := ?; l_window_end_scn NUMBER := ?;")).isTrue();
+        assertThat(result.contains("r.SCN > l_window_start_scn AND r.SCN <= l_window_end_scn")).isTrue();
+        assertThat(result.contains("put_line('@END|' || TO_CHAR(l_window_end_scn) || '|complete')")).isTrue();
+    }
+
+    @Test
+    public void testQueriesExcludeConfiguredTransactions() {
+        final Configuration config = TestHelper.defaultConfig()
+                .with(OracleConnectorConfig.LOG_MINING_TRANSACTION_EXCLUDE_IDS,
+                        "0b000200d7190400,13001700eecb0100")
+                .build();
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        schema = createSchema(connectorConfig);
+
+        final String jdbcQuery = LogMinerQueryBuilder.build(connectorConfig, schema);
+        assertThat(jdbcQuery.contains(
+                "AND (XID IS NULL OR XID NOT IN (HEXTORAW('0B000200D7190400'),HEXTORAW('13001700EECB0100'))) ")).isTrue();
+
+        final String plSqlBlock = LogMinerQueryBuilder.buildPlSqlOutputBlock(connectorConfig, schema);
+        assertThat(plSqlBlock.contains(
+                "AND (r.XID IS NULL OR r.XID NOT IN (HEXTORAW('0B000200D7190400'),HEXTORAW('13001700EECB0100'))) ")).isTrue();
     }
 
     @Test

@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.oracle.OracleConnectorConfig.LogMiningBufferType;
+import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.doc.FixFor;
 import io.debezium.relational.history.KafkaDatabaseHistory;
 
@@ -191,6 +192,35 @@ public class OracleConnectorConfigTest {
 
         config = Configuration.create().with(transactionRetentionField, -1).build();
         assertThat(config.validateAndRecord(Collections.singletonList(transactionRetentionField), LOGGER::error)).isFalse();
+    }
+
+    @Test
+    public void testValidLogMiningTransactionExcludeIds() {
+        final Field transactionExcludeIdsField = OracleConnectorConfig.LOG_MINING_TRANSACTION_EXCLUDE_IDS;
+        final Configuration config = TestHelper.defaultConfig()
+                .with(transactionExcludeIdsField, "0b000200d7190400, 13001700EECB0100")
+                .build();
+
+        assertThat(config.validateAndRecord(Collections.singletonList(transactionExcludeIdsField), LOGGER::error)).isTrue();
+
+        final OracleConnectorConfig connectorConfig = new OracleConnectorConfig(config);
+        assertThat(connectorConfig.getLogMiningTransactionExcludeIds())
+                .containsOnly("0b000200d7190400", "13001700eecb0100");
+    }
+
+    @Test
+    public void testInvalidLogMiningTransactionExcludeIds() {
+        final Field transactionExcludeIdsField = OracleConnectorConfig.LOG_MINING_TRANSACTION_EXCLUDE_IDS;
+
+        Configuration config = Configuration.create()
+                .with(transactionExcludeIdsField, "0b000200d719040")
+                .build();
+        assertThat(config.validateAndRecord(Collections.singletonList(transactionExcludeIdsField), LOGGER::error)).isFalse();
+
+        config = Configuration.create()
+                .with(transactionExcludeIdsField, "0b000200d719040g")
+                .build();
+        assertThat(config.validateAndRecord(Collections.singletonList(transactionExcludeIdsField), LOGGER::error)).isFalse();
     }
 
     @Test

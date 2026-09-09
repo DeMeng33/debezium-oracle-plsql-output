@@ -27,6 +27,14 @@ public interface LogMinerEventProcessor extends AutoCloseable {
     Scn process(OraclePartition partition, Scn startScn, Scn endScn) throws SQLException, InterruptedException;
 
     /**
+     * Whether the last processing call replaced the registered LogMiner file set.
+     * The streaming loop must reload its log files before starting the next window.
+     */
+    default boolean isLogFileListChanged() {
+        return false;
+    }
+
+    /**
      * A callback for the event processor to abandon long running transactions.
      *
      * @param retention the maximum duration in which long running transactions are allowed.

@@ -30,7 +30,6 @@ import io.debezium.connector.oracle.OracleStreamingChangeEventSourceMetrics;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.LogMinerQueryBuilder;
 import io.debezium.connector.oracle.logminer.SqlUtils;
-import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
 import io.debezium.connector.oracle.logminer.processor.AbstractLogMinerEventProcessor;
@@ -92,11 +91,6 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     }
 
     @Override
-    protected OracleConnection getJdbcConnection() {
-        return jdbcConnection;
-    }
-
-    @Override
     protected MemoryTransaction createTransaction(LogMinerEventRow row) {
         return new MemoryTransaction(row.getTransactionId(), row.getScn(), row.getChangeTime(), row.getUserName());
     }
@@ -148,7 +142,6 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
             Optional<Scn> lastScnToAbandonTransactions = getLastScnToAbandon(jdbcConnection, offsetScn, retention);
             if (lastScnToAbandonTransactions.isPresent()) {
                 Scn thresholdScn = lastScnToAbandonTransactions.get();
-                LOGGER.warn("All transactions with SCN <= {} will be abandoned.", thresholdScn);
                 Scn smallestScn = getTransactionCacheMinimumScn();
                 if (!smallestScn.isNull()) {
                     if (thresholdScn.compareTo(smallestScn) < 0) {
@@ -159,7 +152,11 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
                     while (iterator.hasNext()) {
                         Map.Entry<String, MemoryTransaction> entry = iterator.next();
                         if (entry.getValue().getStartScn().compareTo(thresholdScn) <= 0) {
-                            LOGGER.warn("Transaction {} is being abandoned.", entry.getKey());
+                            LOGGER.warn(
+                                    "Oracle LogMiner abandoning transaction due to retention watermark: transactionId={}, startScn={}, events={}, thresholdScn={}, offsetScn={}, offsetCommitScn={}, retention={}, transactionState={}, cacheStateBefore={}",
+                                    entry.getKey(), entry.getValue().getStartScn(), entry.getValue().getEvents().size(), thresholdScn,
+                                    offsetScn, offsetContext.getCommitScn(), retention,
+                                    describeTransactionForDiagnostics(entry.getValue()), describeTransactionCacheState());
                             abandonedTransactionsCache.add(entry.getKey());
                             iterator.remove();
 
@@ -180,25 +177,20 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     }
 
     @Override
-    protected Scn abandonTransactionsAfterEmptyPlSqlOutputWindow(OraclePartition partition, Scn endScn) throws InterruptedException {
+    protected void abandonTransactionsAfterEmptyPlSqlOutputWindow(Scn endScn) throws InterruptedException {
         abandonTransactions(getConfig().getLogMiningTransactionRetention());
-        return abandonTransactionsMissingFromDatabase(partition, endScn);
+        abandonTransactionsMissingFromDatabase(endScn);
     }
 
-    private Scn abandonTransactionsMissingFromDatabase(OraclePartition partition, Scn endScn) throws InterruptedException {
+    private void abandonTransactionsMissingFromDatabase(Scn endScn) {
         missingTransactionsCache.keySet().removeIf(transactionId -> !transactionCache.containsKey(transactionId));
 
-        Scn terminalScn = Scn.NULL;
-        for (String transactionId : new HashSet<>(transactionCache.keySet())) {
-            final MemoryTransaction transaction = transactionCache.get(transactionId);
-            if (transaction == null) {
-                continue;
-            }
+        Iterator<Map.Entry<String, MemoryTransaction>> iterator = transactionCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, MemoryTransaction> entry = iterator.next();
+            final String transactionId = entry.getKey();
             final MissingTransactionObservation observation = missingTransactionsCache.get(transactionId);
             if (observation != null && !shouldCheckMissingTransaction(endScn, observation)) {
-                LOGGER.debug(
-                        "PL/SQL output LogMiner keeping cached transaction {} while waiting to re-check V$TRANSACTION: startScn={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
-                        transactionId, transaction.getStartScn(), endScn, observation.getObservedAtCurrentScn(), observation.getConfirmations());
                 continue;
             }
 
@@ -207,53 +199,23 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
                 continue;
             }
 
-            final TerminalTransactionEventLookup terminalEventLookup = findTerminalTransactionEvent(transactionId, transaction.getStartScn(), endScn);
-            if (terminalEventLookup.isFailed()) {
-                continue;
-            }
-            if (terminalEventLookup.isPresent()) {
-                final TerminalTransactionEvent event = terminalEventLookup.getEvent();
-                if (event.getEventType() == EventType.ROLLBACK) {
-                    LOGGER.info(
-                            "PL/SQL output LogMiner found terminal ROLLBACK for cached transaction {} missing from V$TRANSACTION; removing rolled back transaction. startScn={}, events={}, rollbackScn={}, endScn={}",
-                            transactionId, transaction.getStartScn(), transaction.getEvents().size(), event.getScn(), endScn);
-                    transactionCache.remove(transactionId);
-                    abandonedTransactionsCache.remove(transactionId);
-                    missingTransactionsCache.remove(transactionId);
-                    if (getConfig().isLobEnabled()) {
-                        recentlyProcessedTransactionsCache.put(transactionId, event.getScn());
-                    }
-                    metrics.setActiveTransactions(transactionCache.size());
-                    metrics.incrementRolledBackTransactions();
-                    metrics.addRolledBackTransactionId(transactionId);
-                    counters.rollbackCount++;
-                    terminalScn = maxScn(terminalScn, event.getScn());
-                    continue;
-                }
-                LOGGER.info(
-                        "PL/SQL output LogMiner found terminal COMMIT for cached transaction {} missing from V$TRANSACTION; committing cached transaction. startScn={}, events={}, commitScn={}, endScn={}",
-                        transactionId, transaction.getStartScn(), transaction.getEvents().size(), event.getScn(), endScn);
-                handleCommit(partition, createTerminalEventRow(transactionId, event));
-                terminalScn = maxScn(terminalScn, event.getScn());
-                continue;
-            }
-
-            final MissingTransactionObservation updatedObservation = recordMissingTransactionObservation(transactionId, transaction, endScn, observation);
+            final MissingTransactionObservation updatedObservation = recordMissingTransactionObservation(transactionId, entry.getValue(), endScn, observation);
             if (updatedObservation.canAbandonAt(endScn)) {
                 LOGGER.warn(
-                        "PL/SQL output LogMiner abandoning stale cached transaction {} after repeated V$TRANSACTION misses and mined SCN watermark: startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
-                        transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn,
-                        updatedObservation.getObservedAtCurrentScn(), updatedObservation.getConfirmations());
-                abandonedTransactionsCache.add(transactionId);
-                transactionCache.remove(transactionId);
+                        "PL/SQL output LogMiner abandoning stale cached transaction {} after repeated V$TRANSACTION misses and mined SCN watermark: startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}, offsetScn={}, offsetCommitScn={}, transactionState={}, cacheStateBefore={}",
+                        transactionId, entry.getValue().getStartScn(), entry.getValue().getEvents().size(), endScn,
+                        updatedObservation.getObservedAtCurrentScn(), updatedObservation.getConfirmations(),
+                        offsetContext.getScn(), offsetContext.getCommitScn(), describeTransactionForDiagnostics(entry.getValue()),
+                        describeTransactionCacheState());
+                abandonedTransactionsCache.add(entry.getKey());
+                iterator.remove();
                 missingTransactionsCache.remove(transactionId);
-                metrics.addAbandonedTransactionId(transactionId);
+                metrics.addAbandonedTransactionId(entry.getKey());
                 metrics.setActiveTransactions(transactionCache.size());
             }
         }
         final Scn smallestScn = getTransactionCacheMinimumScn();
         metrics.setOldestScn(smallestScn.isNull() ? Scn.valueOf(-1) : smallestScn);
-        return terminalScn;
     }
 
     private boolean shouldCheckMissingTransaction(Scn endScn, MissingTransactionObservation observation) {
@@ -270,26 +232,16 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
             final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
             final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
             missingTransactionsCache.put(transactionId, newObservation);
-            LOGGER.info(
-                    "PL/SQL output LogMiner observed cached transaction {} missing from V$TRANSACTION; keeping until mined through observed database SCN. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
-                    transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn, currentScn, newObservation.getConfirmations());
             return newObservation;
         }
         if (observation.getObservedAtCurrentScn().isNull()) {
             final Scn currentScn = getCurrentScnForMissingTransaction(transactionId);
             final MissingTransactionObservation newObservation = new MissingTransactionObservation(currentScn, now);
             missingTransactionsCache.put(transactionId, newObservation);
-            LOGGER.info(
-                    "PL/SQL output LogMiner refreshed missing transaction {} database SCN watermark after an earlier current SCN lookup failure. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}",
-                    transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn, currentScn, newObservation.getConfirmations());
             return newObservation;
         }
 
         observation.confirm(now);
-        LOGGER.info(
-                "PL/SQL output LogMiner confirmed cached transaction {} still missing from V$TRANSACTION. startScn={}, events={}, endScn={}, missingObservedAtCurrentScn={}, confirmations={}, minedThroughObservedScn={}",
-                transactionId, transaction.getStartScn(), transaction.getEvents().size(), endScn,
-                observation.getObservedAtCurrentScn(), observation.getConfirmations(), observation.hasBeenMinedThrough(endScn));
         return observation;
     }
 
@@ -410,6 +362,11 @@ public class MemoryLogMinerEventProcessor extends AbstractLogMinerEventProcessor
     @Override
     protected int getTransactionEventCount(MemoryTransaction transaction) {
         return transaction.getEvents().size();
+    }
+
+    @Override
+    protected long getTransactionCacheEventCount() {
+        return transactionCache.values().stream().mapToLong(transaction -> transaction.getEvents().size()).sum();
     }
 
     @Override

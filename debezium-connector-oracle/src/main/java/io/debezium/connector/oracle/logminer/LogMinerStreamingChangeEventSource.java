@@ -243,7 +243,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                         }
 
                         if (rebuildLogFilesBeforeMiningSession) {
-                            LOGGER.warn("Rebuilding Oracle LogMiner log file list before retrying mining session: startScn={}, endScn={}, attempt={}",
+                            LOGGER.warn("Rebuilding Oracle LogMiner log file list before next mining session: startScn={}, endScn={}, attempt={}",
                                     startScn, endScn, retryAttempts);
                             endMiningSession(jdbcConnection, offsetContext);
                             initializeRedoLogsForMining(jdbcConnection, true, startScn, endScn);
@@ -269,6 +269,9 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                                             startScn, endScn, offsetContext.getScn(), offsetContext.getCommitScn());
                                 }
                                 final Scn nextStartScn = processor.process(partition, startScn, endScn);
+                                // Recovery may have replaced A's files with a subset for the failed window.
+                                // The cached currentLogFiles no longer describe that session.
+                                rebuildLogFilesBeforeMiningSession = processor.isLogFileListChanged();
                                 if (plSqlOutputStrategy) {
                                     LOGGER.debug(
                                             "{} processed window: scnRange=[{}, {}], nextStartScn={}, durationMs={}, offsetScn={}, offsetCommitScn={}, activeTransactions={}, sleepMs={}",
@@ -817,11 +820,6 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         }
         else {
             if (prevEndScn != null && topScnToMine.compareTo(prevEndScn) <= 0) {
-                if (isPlSqlOutputStrategy()) {
-                    LOGGER.debug("Using Top SCN calculation {} as end SCN for PL/SQL output strategy despite previous end SCN {}. currentScn {}, startScn {}",
-                            topScnToMine, prevEndScn, currentScn, startScn);
-                    return topScnToMine;
-                }
                 LOGGER.debug("Max batch size too small, using current SCN {} as end SCN.", currentScn);
                 return currentScn;
             }
@@ -831,7 +829,7 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                 return currentScn;
             }
 
-            if (!isPlSqlOutputStrategy() && prevEndScn != null) {
+            if (prevEndScn != null) {
                 final Scn deltaScn = currentScn.subtract(prevEndScn);
                 if (deltaScn.compareTo(Scn.valueOf(connectorConfig.getLogMiningScnGapDetectionGapSizeMin())) > 0) {
                     Optional<OffsetDateTime> prevEndScnTimestamp = connection.getScnToTimestamp(prevEndScn);

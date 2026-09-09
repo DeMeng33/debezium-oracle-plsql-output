@@ -7,7 +7,9 @@ package io.debezium.connector.oracle.logminer;
 
 import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
@@ -66,6 +68,7 @@ public class LogMinerQueryBuilder {
 
         // These bind parameters will be bound when the query is executed by the caller.
         query.append("WHERE SCN > ? AND SCN <= ? ");
+        query.append(buildExcludedTransactionPredicate(connectorConfig, "XID"));
 
         // The connector currently requires a "database.pdb.name" configuration property when using CDB mode.
         // If this property is provided, build a predicate that will be used in later predicates.
@@ -162,13 +165,16 @@ public class LogMinerQueryBuilder {
         final String ddlPredicate = buildPlSqlDdlPredicate(connectorConfig, schema, "r.", pdbPredicate);
         final String unorderedQuery = PLSQL_OUTPUT_SELECT_LIST.replace("SELECT ", "SELECT ROWNUM AS LOGMNR_ROW_SEQUENCE, ")
                 .replace("FROM " + LOGMNR_CONTENTS_VIEW + " ", "FROM " + LOGMNR_CONTENTS_VIEW + " r ") +
-                "WHERE r.SCN > ? AND r.SCN <= ? " +
+                "WHERE r.SCN > l_window_start_scn AND r.SCN <= l_window_end_scn " +
+                buildExcludedTransactionPredicate(connectorConfig, "r.XID") +
                 "AND ((" + rowPredicate + ") " +
                 "OR (r.OPERATION_CODE IN (7,34,36)) " +
                 "OR (" + ddlPredicate + "))";
         final String query = "SELECT q.* FROM (" + unorderedQuery + ") q ORDER BY q.SCN, q.LOGMNR_ROW_SEQUENCE";
 
         return "DECLARE " +
+                "l_window_start_scn NUMBER := ?; " +
+                "l_window_end_scn NUMBER := ?; " +
                 "l_output_bytes NUMBER := 0; " +
                 "l_completed_scn_groups NUMBER := 0; " +
                 "l_in_csf_group BOOLEAN := FALSE; " +
@@ -265,8 +271,21 @@ public class LogMinerQueryBuilder {
                 "END LOOP; " +
                 "IF NOT l_truncated THEN " +
                 "complete_group; " +
+                "put_line('@END|' || TO_CHAR(l_window_end_scn) || '|complete'); " +
                 "END IF; " +
                 "END;";
+    }
+
+    private static String buildExcludedTransactionPredicate(OracleConnectorConfig connectorConfig, String xidColumn) {
+        final Set<String> transactionIds = connectorConfig.getLogMiningTransactionExcludeIds();
+        if (transactionIds.isEmpty()) {
+            return "";
+        }
+        final String excludedIds = transactionIds.stream()
+                .sorted()
+                .map(transactionId -> "HEXTORAW('" + transactionId.toUpperCase() + "')")
+                .collect(Collectors.joining(","));
+        return "AND (" + xidColumn + " IS NULL OR " + xidColumn + " NOT IN (" + excludedIds + ")) ";
     }
 
     private static String buildPlSqlCapturedTablePredicate(OracleConnectorConfig connectorConfig, String alias, String dmlOperationCodes, String pdbPredicate) {
