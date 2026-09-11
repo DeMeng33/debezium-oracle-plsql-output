@@ -35,15 +35,18 @@ import io.debezium.DebeziumException;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.events.LogMinerEventRow;
+import io.debezium.relational.TableId;
 
 /**
  * Verifies empty PL/SQL windows independently of the online dictionary. Only a complete,
- * unambiguously mapped SMON_SCN_TIME SCN may be consumed as transaction metadata.
+ * verified SMON_SCN_TIME boundary or a fully classified window without captured changes
+ * may be consumed as transaction metadata.
  * No transaction or offset is changed here; all validation and session changes precede replay.
  */
 class LogMinerDictionaryRecovery implements AutoCloseable {
     private static final Logger LOGGER = LoggerFactory.getLogger(LogMinerDictionaryRecovery.class);
     private static final int MAX_BOUNDARY_ROWS = 100_000;
+    private static final int SELECT_FOR_UPDATE = 25;
     private static final String RAW_QUERY = "SELECT q.* FROM (SELECT ROWNUM AS ROW_SEQUENCE, SCN, OPERATION_CODE, DATA_OBJ#, "
             + "RAWTOHEX(XID) AS XID_HEX, RS_ID, SSN, CSF, STATUS, INFO, TIMESTAMP AS CHANGE_TIME, THREAD# AS REDO_THREAD "
             + "FROM V$LOGMNR_CONTENTS WHERE SCN > ? AND SCN <= ?) q ORDER BY q.SCN, q.ROW_SEQUENCE";
@@ -65,6 +68,10 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
     private final Map<String, String> diagnosticMappings = new HashMap<>();
     private final Map<String, Set<String>> objectCandidates = new LinkedHashMap<>();
     private final Map<String, String> resolvedObjects = new HashMap<>();
+    private final Set<String> objectIdFallbackMappings = new HashSet<>();
+    private final Set<String> excludedTableMappings = new HashSet<>();
+    private final Map<String, String> excludedIndexTables = new HashMap<>();
+    private final Map<String, String> dictionaryEvidence = new LinkedHashMap<>();
     private final List<String> dictionaryChecks = new ArrayList<>();
     private Map<String, String> dictionaryContainers = Collections.emptyMap();
     private String dictionarySession;
@@ -133,8 +140,10 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
         Scn firstBadScn = null;
         long rows = 0;
         long boundaryRows = 0;
+        long selectForUpdateRows = 0;
         String requiredOnlineRow = null;
         final Map<String, RawRow> filteredObjects = new HashMap<>();
+        final Set<String> incompleteInternalObjects = new HashSet<>();
         try (PreparedStatement statement = connection.prepareStatement(RAW_QUERY)) {
             statement.setString(1, start.toString());
             statement.setString(2, end.toString());
@@ -146,9 +155,19 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                     rows++;
                     actualRows = rows;
                     lastInspectedRow = row.toString();
-                    if (row.code != 6) {
+                    if (row.code == 0 && !isCompleteRawMetadata(row)) {
+                        incompleteInternalObjects.add(row.mappingKey());
+                    }
+                    if (row.code == SELECT_FOR_UPDATE) {
+                        // Validate every row, not a representative per object or transaction.
+                        if (!isCompleteSelectForUpdate(row)) {
+                            requiredOnlineRow = "incomplete or invalid SELECT_FOR_UPDATE: " + row;
+                        }
+                        selectForUpdateRows++;
+                    }
+                    else if (row.code != 6) {
                         if (row.isDml() || row.code == 0) {
-                            filteredObjects.putIfAbsent(row.mappingKey(), row);
+                            filteredObjects.putIfAbsent(row.filteredValidationKey(), row);
                         }
                         else {
                             requiredOnlineRow = row.toString();
@@ -181,33 +200,85 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
             stage = "ONLINE_COUNT";
             // A filtered online query can legitimately return no captured rows in a physically
             // nonempty window. Raw evidence alone cannot distinguish that from decoder failure.
-            // This aggregate is diagnostic only, and must agree with the independent raw scan.
-            if (count(onlineConnection, start, end) != expected) {
+            // If the online dictionary cannot even count, use an independently verified
+            // metadata-only window; never interpret the exception as an empty result.
+            final long onlineRows;
+            try {
+                onlineRows = count(onlineConnection, start, end);
+            }
+            catch (SQLException e) {
+                if (e.getErrorCode() != 20004) {
+                    throw e;
+                }
+                LOGGER.warn("LOGMINER_ONLINE_COUNT_UNAVAILABLE recoveryId={}, range=({}, {}], rawRows={}, error={}",
+                        recoveryId, start, end, expected, e.getMessage());
+                try {
+                    return verifyRawFilteredWindow(start, end, expected);
+                }
+                catch (SQLException | RuntimeException | InterruptedException failure) {
+                    failure.addSuppressed(e);
+                    throw failure;
+                }
+            }
+            if (onlineRows != expected) {
                 throw new DebeziumException("Online/raw LogMiner row count mismatch; refusing offset advancement for (" + start + ", " + end + "]");
             }
             // The independent raw scan must also show that zero captured output is possible.
             // COMMIT/ROLLBACK are unconditionally selected online; their absence cannot be
             // explained by a table filter. Only unambiguously mapped SYS DML/INTERNAL and
-            // START rows may be absent from the filtered online output.
+            // excluded table DML, START and complete SELECT_FOR_UPDATE rows may be absent
+            // from the filtered online output.
             String emptyFailure = requiredOnlineRow == null ? null : "raw redo requires an online row: " + requiredOnlineRow;
             if (emptyFailure == null && !filteredObjects.isEmpty()) {
                 prepareObjectMappings(filteredObjects.values());
-                for (RawRow row : filteredObjects.values()) {
-                    try {
+                try {
+                    Set<String> systemTransactions = resolvedSystemTransactions(filteredObjects.values());
+                    for (RawRow row : filteredObjects.values()) {
+                        if (row.isObjectlessInternal()) {
+                            if (!isCompleteObjectlessInternal(row) || !systemTransactions.contains(row.event.getTransactionId())) {
+                                emptyFailure = "raw redo contains an objectless INTERNAL without a verified SYS transaction association: " + row;
+                                break;
+                            }
+                            LOGGER.info("Validated objectless INTERNAL associated with SYS transaction in filtered interval: {}", row);
+                            continue;
+                        }
+                        if (row.isRootBootstrapInternal()) {
+                            if (!isCompleteRootBootstrapInternal(row)) {
+                                emptyFailure = "raw redo contains incomplete root bootstrap INTERNAL metadata: " + row;
+                                break;
+                            }
+                            logRootBootstrapInternal(row);
+                            continue;
+                        }
                         String object = resolveObject(row);
-                        if (!object.startsWith("SYS.") || (row.event.getStatus() != 0 && row.event.getStatus() != 2)) {
+                        if (row.code == 0 && excludedIndexTables.containsKey(row.mappingKey())) {
+                            if (incompleteInternalObjects.contains(row.mappingKey())) {
+                                emptyFailure = "raw redo contains incomplete excluded-index INTERNAL metadata: " + row;
+                                break;
+                            }
+                            logFilteredIndex(row);
+                            continue;
+                        }
+                        if ((!object.startsWith("SYS.") && !(row.isDml() && excludedTableMappings.contains(row.mappingKey())))
+                                || (row.event.getStatus() != 0 && row.event.getStatus() != 2)) {
                             emptyFailure = "raw redo contains a potentially captured or invalid operation: " + row + ", object=" + object;
                             break;
                         }
+                        if (row.isDml() && excludedTableMappings.contains(row.mappingKey())) {
+                            logFilteredDml(row);
+                        }
                     }
-                    catch (DebeziumException e) {
-                        emptyFailure = e.getMessage();
-                        break;
-                    }
+                }
+                catch (DebeziumException e) {
+                    emptyFailure = e.getMessage();
                 }
             }
             LOGGER.info("Online/raw counts agree; requiring filtered online replay: scnRange=({}, {}], rawRows={}, emptyReplayRejection={}",
                     start, end, rows, emptyFailure);
+            if (emptyFailure == null && selectForUpdateRows > 0) {
+                LOGGER.info("LOGMINER_SELECT_FOR_UPDATE_FILTERED recoveryId={}, range=({}, {}], rows={}, replayOnlineRequired=true",
+                        recoveryId, start, end, selectForUpdateRows);
+            }
             return new Plan(end, true, Collections.emptyList(), emptyFailure);
         }
         if (config.isLobEnabled()) {
@@ -222,34 +293,92 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
         if (boundaryRows > MAX_BOUNDARY_ROWS) {
             throw new DebeziumException("Metadata SCN exceeds validation row limit " + MAX_BOUNDARY_ROWS + ": SCN=" + firstBadScn);
         }
-        final List<RawRow> boundary = new ArrayList<>();
         stage = "BOUNDARY_SCAN";
+        final List<RawRow> boundary = readMetadataRows(start, firstBadScn, boundaryRows);
+        return metadataPlan(start, end, firstBadScn, expected, boundary, true);
+    }
+
+    private Plan verifyRawFilteredWindow(Scn start, Scn end, long expected) throws SQLException, InterruptedException {
+        stage = "RAW_FILTERED_WINDOW_SCAN";
+        if (config.isLobEnabled()) {
+            throw new DebeziumException("Raw filtered-window recovery does not support LOB re-mining; refusing offset advancement");
+        }
+        // Bound both memory and audit size. This is a complete-window proof, not a sample.
+        if (expected > MAX_BOUNDARY_ROWS) {
+            throw new DebeziumException("Raw filtered window exceeds validation row limit " + MAX_BOUNDARY_ROWS + "; refusing offset advancement");
+        }
+        List<RawRow> rows = readMetadataRows(start, end, expected);
+        Map<String, Long> counts = new LinkedHashMap<>();
+        Map<String, RawRow> examples = new LinkedHashMap<>();
+        for (RawRow row : rows) {
+            String key = "operationCode=" + row.code + ", DATA_OBJ#=" + row.objectId + ", status=" + row.event.getStatus();
+            counts.merge(key, 1L, Long::sum);
+            examples.putIfAbsent(key, row);
+        }
+        // Report every operation/object group before validation can reject one. This also
+        // exposes captured/unknown objects when recovery needs additional dictionary evidence.
+        for (Map.Entry<String, Long> entry : counts.entrySet()) {
+            LOGGER.info("LOGMINER_RAW_WINDOW_CONTENTS recoveryId={}, range=({}, {}], {}, rows={}, example={}",
+                    recoveryId, start, end, entry.getKey(), entry.getValue(), examples.get(entry.getKey()));
+        }
+        return metadataPlan(start, end, end, expected, rows, false);
+    }
+
+    private List<RawRow> readMetadataRows(Scn start, Scn end, long expected) throws SQLException, InterruptedException {
+        final List<RawRow> boundary = new ArrayList<>();
         try (PreparedStatement statement = connection.prepareStatement(RAW_QUERY)) {
             statement.setString(1, start.toString());
-            statement.setString(2, firstBadScn.toString());
+            statement.setString(2, end.toString());
             statement.setFetchSize(config.getLogMiningViewFetchSize());
             try (ResultSet result = statement.executeQuery()) {
                 while (result.next()) {
                     checkRunning();
                     if (boundary.size() == MAX_BOUNDARY_ROWS) {
-                        throw new DebeziumException("Metadata SCN grew beyond validation row limit: SCN=" + firstBadScn);
+                        throw new DebeziumException("Metadata range grew beyond validation row limit: range=(" + start + ", " + end + "]");
                     }
                     boundary.add(new RawRow(result, config.getCatalogName()));
                 }
             }
         }
-        if (boundary.size() != boundaryRows) {
-            throw new DebeziumException("Incomplete metadata SCN: SCN=" + firstBadScn + ", expectedRows=" + boundaryRows + ", actualRows=" + boundary.size());
+        if (boundary.size() != expected) {
+            throw new DebeziumException("Incomplete metadata range: range=(" + start + ", " + end + "], expectedRows=" + expected + ", actualRows=" + boundary.size());
         }
+        return boundary;
+    }
+
+    private Plan metadataPlan(Scn start, Scn end, Scn metadataEnd, long expected, List<RawRow> boundary, boolean requireSmonDml)
+            throws SQLException, InterruptedException {
         lastInspectedRow = boundary.isEmpty() ? null : boundary.get(0).toString();
         prepareObjectMappings(boundary);
-        stage = "BOUNDARY_VALIDATION";
-        List<LogMinerEventRow> boundaries = validateBoundary(boundary);
+        stage = requireSmonDml ? "BOUNDARY_VALIDATION" : "RAW_FILTERED_WINDOW_VALIDATION";
+        List<LogMinerEventRow> boundaries = validateBoundary(boundary, requireSmonDml);
         final List<String> records = new ArrayList<>();
         final Map<Integer, Long> operations = new HashMap<>();
+        final Map<String, String> auditMappings = new LinkedHashMap<>();
+        final Map<String, String> auditChecks = new LinkedHashMap<>();
         int discardedDml = 0;
         int discardedNonDml = 0;
+        int filteredSelectForUpdate = 0;
         for (RawRow row : boundary) {
+            if (row.code == SELECT_FOR_UPDATE) {
+                LOGGER.info("LOGMINER_SELECT_FOR_UPDATE_FILTERED recoveryId={}, rawRow={}", recoveryId, row);
+                filteredSelectForUpdate++;
+                continue;
+            }
+            if (row.isDml() && excludedTableMappings.contains(row.mappingKey())) {
+                logFilteredDml(row);
+                continue;
+            }
+            if (row.code == 0 && excludedIndexTables.containsKey(row.mappingKey())) {
+                logFilteredIndex(row);
+                continue;
+            }
+            if (diagnosticMappings.containsKey(row.mappingKey())) {
+                auditMappings.put(row.mappingKey(), diagnosticMappings.get(row.mappingKey()));
+            }
+            if (dictionaryEvidence.containsKey(row.mappingKey())) {
+                auditChecks.put(row.mappingKey(), dictionaryEvidence.get(row.mappingKey()));
+            }
             operations.merge(row.code, 1L, Long::sum);
             final String action;
             if (row.code == 7 || row.code == 36) {
@@ -267,23 +396,31 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
             records.add("action=" + action + ", " + row + ", objectMapping="
                     + (row.objectId == null ? "NOT_APPLICABLE" : diagnosticMappings.getOrDefault(row.mappingKey(), "NOT_REQUIRED_FOR_BOUNDARY")));
         }
-        final Audit audit = new Audit(recoveryId, records, "requestedRange=(" + start + ", " + end + "], anomalyScn=" + firstBadScn
+        final Audit audit = new Audit(recoveryId, records, "requestedRange=(" + start + ", " + end + "], anomalyScn=" + anomalyScn
+                + ", validatedRange=(" + start + ", " + metadataEnd + "]"
+                + ", verificationMode=" + (requireSmonDml ? "SMON_BOUNDARY" : "RAW_FILTERED_WINDOW")
                 + ", rawWindowRows=" + expected + ", anomalyRows=" + boundary.size() + ", discardedSysDml=" + discardedDml
                 + ", ignoredNonDml=" + discardedNonDml + ", preservedBoundaries=" + boundaries.size() + ", operations=" + operations
-                + ", logFiles=" + files + ", objectMappings=" + diagnosticMappings + ", sessionIdentity=" + sessionIdentity
+                + ", filteredSelectForUpdate=" + filteredSelectForUpdate
+                + ", logFiles=" + files + ", objectMappings=" + auditMappings + ", sessionIdentity=" + sessionIdentity
                 + ", dictionarySession=" + dictionarySession + ", dictionaryContext=" + dictionaryContext
-                + ", dictionaryContainers=" + dictionaryContainers + ", dictionaryChecks=" + dictionaryChecks);
+                + ", dictionaryContainers=" + dictionaryContainers + ", dictionaryChecks=" + auditChecks.values());
         // Restore before emitting any commit. A failed END/ADD/START must not advance offsets.
-        restart(files, start, firstBadScn, true);
-        return new Plan(firstBadScn, false, boundaries, null, audit);
+        restart(files, start, metadataEnd, true);
+        return new Plan(metadataEnd, false, boundaries, null, audit);
     }
 
-    private List<LogMinerEventRow> validateBoundary(List<RawRow> rows) {
+    private List<LogMinerEventRow> validateBoundary(List<RawRow> rows, boolean requireSmonDml) throws InterruptedException {
         final Map<String, String> mappings = new HashMap<>();
         final List<LogMinerEventRow> boundaries = new ArrayList<>();
+        final Set<String> systemTransactions = resolvedSystemTransactions(rows);
         int ignoredDml = 0;
         for (RawRow row : rows) {
+            checkRunning();
             lastInspectedRow = row.toString();
+            if (!requireSmonDml && !isCompleteRawMetadata(row)) {
+                throw unsafe("incomplete or invalid raw filtered-window metadata", row);
+            }
             if (row.code == 7 || row.code == 36) {
                 if (row.event.getTransactionId() == null || row.event.getThread() <= 0 || row.event.getChangeTime() == null || row.event.getStatus() != 0
                         || row.csf != 0) {
@@ -295,6 +432,23 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
             else if (row.code == 6) {
                 // START has no captured DML. Existing transactions remain in the processor cache.
                 continue;
+            }
+            else if (row.code == SELECT_FOR_UPDATE) {
+                if (!isCompleteSelectForUpdate(row)) {
+                    throw unsafe("incomplete or invalid SELECT_FOR_UPDATE", row);
+                }
+            }
+            else if (row.isObjectlessInternal()) {
+                if (!isCompleteObjectlessInternal(row) || !systemTransactions.contains(row.event.getTransactionId())) {
+                    throw unsafe("objectless INTERNAL without a verified SYS transaction association", row);
+                }
+                LOGGER.info("Validated objectless INTERNAL associated with SYS transaction at metadata boundary: {}", row);
+            }
+            else if (row.isRootBootstrapInternal()) {
+                if (!isCompleteRootBootstrapInternal(row)) {
+                    throw unsafe("incomplete root bootstrap INTERNAL metadata", row);
+                }
+                logRootBootstrapInternal(row);
             }
             else if (row.isDml() || row.code == 0) {
                 String object = mappings.get(row.mappingKey());
@@ -309,6 +463,14 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                 if (row.isDml() && "SYS.SMON_SCN_TIME".equals(object)) {
                     ignoredDml++;
                 }
+                else if (row.isDml() && excludedTableMappings.contains(row.mappingKey())) {
+                    // Normal table filtering; logged at INFO after the entire boundary validates.
+                }
+                else if (row.code == 0 && excludedIndexTables.containsKey(row.mappingKey())) {
+                    if (!isCompleteRawMetadata(row)) {
+                        throw unsafe("incomplete excluded-index INTERNAL metadata", row);
+                    }
+                }
                 else if (row.code != 0 || !object.startsWith("SYS.")) {
                     throw unsafe("captured or unsupported object operation on " + object, row);
                 }
@@ -317,12 +479,55 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                 throw unsafe("unsupported operation (including DDL/LOB)", row);
             }
         }
-        if (ignoredDml == 0) {
+        if (requireSmonDml && ignoredDml == 0) {
             throw new DebeziumException("No verified SMON_SCN_TIME DML at metadata boundary; refusing offset advancement");
         }
-        LOGGER.info("Validated complete metadata SCN: scn={}, rawRows={}, ignoredSysDml={}, commitRollbackRows={}",
-                rows.get(0).scn, rows.size(), ignoredDml, boundaries.size());
+        LOGGER.info("Validated complete metadata range: firstScn={}, lastScn={}, rawRows={}, ignoredSysDml={}, commitRollbackRows={}",
+                rows.get(0).scn, rows.get(rows.size() - 1).scn, rows.size(), ignoredDml, boundaries.size());
         return boundaries;
+    }
+
+    private boolean isCompleteSelectForUpdate(RawRow row) {
+        // SELECT FOR UPDATE locks rows without changing their values. Both normal LogMiner
+        // queries exclude operation 25 regardless of table ownership. No object mapping or
+        // SQL reconstruction is needed, even with raw dictionary-mismatch status 2; other
+        // operations in the same transaction/SCN still require independent validation.
+        return row.code == SELECT_FOR_UPDATE && isCompleteRawMetadata(row);
+    }
+
+    private boolean isCompleteRawMetadata(RawRow row) {
+        return row.event.getTransactionId() != null && row.event.getThread() > 0
+                && row.event.getChangeTime() != null && row.event.getRsId() != null && !row.event.getRsId().trim().isEmpty()
+                && row.event.getSsn() >= 0 && row.csf == 0 && (row.event.getStatus() == 0 || row.event.getStatus() == 2);
+    }
+
+    private Set<String> resolvedSystemTransactions(Collection<RawRow> rows) {
+        Set<String> transactions = new HashSet<>();
+        for (RawRow row : rows) {
+            if ((row.isDml() || row.code == 0) && !row.isObjectlessInternal() && !row.isRootBootstrapInternal()) {
+                String object = resolveObject(row);
+                if (object.startsWith("SYS.") && row.event.getTransactionId() != null && row.event.getThread() > 0
+                        && row.event.getChangeTime() != null && row.csf == 0
+                        && (row.event.getStatus() == 0 || row.event.getStatus() == 2)) {
+                    transactions.add(row.event.getTransactionId());
+                }
+            }
+        }
+        return transactions;
+    }
+
+    private boolean isCompleteObjectlessInternal(RawRow row) {
+        return row.code == 0 && row.isObjectlessInternal() && row.event.getTransactionId() != null && row.event.getThread() > 0
+                && row.event.getChangeTime() != null && row.event.getStatus() == 0 && row.csf == 0;
+    }
+
+    private boolean isCompleteRootBootstrapInternal(RawRow row) {
+        return row.isRootBootstrapInternal() && isCompleteRawMetadata(row) && row.event.getStatus() == 0;
+    }
+
+    private void logRootBootstrapInternal(RawRow row) {
+        LOGGER.info("LOGMINER_ROOT_BOOTSTRAP_INTERNAL_FILTERED recoveryId={}, object=SYS._NEXT_OBJECT, objectId=1, rawRow={}",
+                recoveryId, row);
     }
 
     private String resolveObject(RawRow row) {
@@ -339,14 +544,93 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
             diagnosticMappings.put(row.mappingKey(), "UNRESOLVED:" + identities);
             throw unsafe("unmapped or ambiguous " + row.referenceType() + "; candidates=" + identities, row);
         }
+        if (row.isDml() && objectIdFallbackMappings.contains(row.mappingKey()) && !excludedTableMappings.contains(row.mappingKey())) {
+            throw unsafe("OBJECT_ID fallback is only allowed for an excluded non-system table", row);
+        }
         diagnosticMappings.put(row.mappingKey(), identities.toString());
         return resolvedObjects.get(row.mappingKey());
+    }
+
+    private boolean isExcludedTable(TableId tableId, String objectType) {
+        // An index name cannot be checked against the table capture list. Only resolved
+        // tables (including cluster members and partitions) may explain filtered DML.
+        boolean table = "TABLE".equals(objectType) || "TABLE PARTITION".equals(objectType)
+                || "TABLE SUBPARTITION".equals(objectType) || "CLUSTER".equals(objectType);
+        return table && !"SYS".equals(tableId.schema()) && config.getTableFilters() != null
+                && config.getTableFilters().dataCollectionFilter() != null
+                && !config.getTableFilters().dataCollectionFilter().isIncluded(tableId);
+    }
+
+    private void logFilteredDml(RawRow row) {
+        LOGGER.info("LOGMINER_NON_CAPTURED_DML_FILTERED recoveryId={}, captureDecision=EXCLUDED_NON_CAPTURED_TABLE, object={}, mappingEvidence={}, rawRow={}",
+                recoveryId, resolvedObjects.get(row.mappingKey()), dictionaryEvidence.get(row.mappingKey()), row);
+    }
+
+    private void logFilteredIndex(RawRow row) {
+        LOGGER.info("LOGMINER_NON_CAPTURED_INDEX_FILTERED recoveryId={}, index={}, table={}, mappingEvidence={}, rawRow={}",
+                recoveryId, resolvedObjects.get(row.mappingKey()), excludedIndexTables.get(row.mappingKey()), dictionaryEvidence.get(row.mappingKey()), row);
+    }
+
+    private String resolveExcludedIndexTable(RawRow row, String owner, String indexName) throws SQLException, InterruptedException {
+        List<String> evidence = new ArrayList<>();
+        TableId parent = null;
+        boolean ordinaryTableIndex = false;
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT TABLE_OWNER, TABLE_NAME, INDEX_TYPE, TABLE_TYPE FROM DBA_INDEXES WHERE OWNER = ? AND INDEX_NAME = ?")) {
+            statement.setString(1, owner);
+            statement.setString(2, indexName);
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    checkRunning();
+                    String tableOwner = result.getString(1);
+                    String tableName = result.getString(2);
+                    String indexType = result.getString(3);
+                    String tableType = result.getString(4);
+                    evidence.add("table=" + tableOwner + "." + tableName + ", indexType=" + indexType + ", tableType=" + tableType);
+                    ordinaryTableIndex = "TABLE".equals(tableType) && ("NORMAL".equals(indexType) || "NORMAL/REV".equals(indexType));
+                    if (tableOwner != null && tableName != null) {
+                        parent = new TableId(config.getCatalogName(), tableOwner, tableName);
+                    }
+                }
+            }
+        }
+        // Never apply the table filter to the index name. Limit this proof to ordinary
+        // indexes on one explicitly excluded table; domain/LOB/IOT/cluster indexes need
+        // different dependency evidence. The physical object must already be unique.
+        if (evidence.size() == 1 && ordinaryTableIndex && parent != null && isExcludedTable(parent, "TABLE")) {
+            excludedIndexTables.put(row.mappingKey(), parent.toString());
+        }
+        return "index=" + owner + "." + indexName + ", parentCandidates=" + evidence
+                + ", excluded=" + excludedIndexTables.containsKey(row.mappingKey());
     }
 
     private void prepareObjectMappings(Collection<RawRow> rows) throws SQLException, InterruptedException {
         final Map<String, RawRow> objects = new LinkedHashMap<>();
         for (RawRow row : rows) {
             if (row.isDml() || row.code == 0) {
+                if (row.isObjectlessInternal()) {
+                    String mapping = "NOT_APPLICABLE:INTERNAL_WITHOUT_OBJECT_REFERENCE";
+                    diagnosticMappings.put(row.mappingKey(), mapping);
+                    String evidence = "referenceType=" + row.referenceType() + ", DATA_OBJ#=" + row.objectId + ", mapping=" + mapping
+                            + ", rawRow=" + row;
+                    if (!dictionaryChecks.contains(evidence)) {
+                        dictionaryChecks.add(evidence);
+                    }
+                    LOGGER.info("LOGMINER_OBJECTLESS_INTERNAL recoveryId={}, {}", recoveryId, evidence);
+                    continue;
+                }
+                if (row.isRootBootstrapInternal()) {
+                    String mapping = "VERIFIED_ROOT_BOOTSTRAP_INTERNAL:SYS._NEXT_OBJECT(OBJECT_ID=1)";
+                    diagnosticMappings.put(row.mappingKey(), mapping);
+                    String evidence = "referenceType=" + row.referenceType() + ", DATA_OBJ#=" + row.objectId + ", mapping=" + mapping
+                            + ", rawRow=" + row;
+                    if (!dictionaryChecks.contains(evidence)) {
+                        dictionaryChecks.add(evidence);
+                    }
+                    dictionaryEvidence.put(row.mappingKey(), evidence);
+                    LOGGER.info("LOGMINER_ROOT_BOOTSTRAP_INTERNAL recoveryId={}, {}", recoveryId, evidence);
+                    continue;
+                }
                 objects.putIfAbsent(row.mappingKey(), row);
             }
         }
@@ -377,7 +661,7 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                     + "o.OBJECT_ID, o.DATA_OBJECT_ID, o.OBJECT_TYPE "
                     + "FROM DBA_OBJECTS o LEFT JOIN DBA_TABLES t ON o.OBJECT_TYPE = 'CLUSTER' "
                     + "AND t.OWNER = o.OWNER AND t.CLUSTER_NAME = o.OBJECT_NAME "
-                    + "WHERE (o.DATA_OBJECT_ID = ? OR (? = 1 AND o.OBJECT_ID = ?)) AND o.DATA_OBJECT_ID IS NOT NULL")) {
+                    + "WHERE (o.DATA_OBJECT_ID = ? OR (? = 1 AND o.OBJECT_ID = ?)) AND o.DATA_OBJECT_ID > 0")) {
                 for (RawRow row : objects.values()) {
                     checkRunning();
                     lastInspectedRow = row.toString();
@@ -386,9 +670,13 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                     }
                     Set<String> local = new LinkedHashSet<>();
                     List<String> matches = new ArrayList<>();
+                    String indexOwner = null;
+                    String indexName = null;
                     Set<String> candidates = objectCandidates.computeIfAbsent(row.mappingKey(), key -> new LinkedHashSet<>());
                     statement.setString(1, row.objectId);
-                    statement.setInt(2, row.code == 0 ? 1 : 0);
+                    // Keep both candidate sets before deciding whether a reference is unique.
+                    // OBJECT_ID-only DML is usable solely for normal non-captured table filtering.
+                    statement.setInt(2, 1);
                     statement.setString(3, row.objectId);
                     try (ResultSet result = statement.executeQuery()) {
                         while (result.next()) {
@@ -399,15 +687,27 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                             String resultObjectId = result.getString(4);
                             String resultDataObjectId = result.getString(5);
                             boolean matchedDataObject = row.objectId.equals(resultDataObjectId);
-                            boolean matchedObject = row.code == 0 && row.objectId.equals(resultObjectId);
+                            boolean matchedObject = row.objectId.equals(resultObjectId);
                             if (!matchedDataObject && !matchedObject) {
                                 throw unsafe("dictionary returned an object that did not match the raw reference", row);
                             }
                             String mapped = result.getString(2) + "." + result.getString(3);
+                            String objectType = result.getString(6);
+                            if (row.code == 0 && !"SYS".equals(result.getString(2))
+                                    && ("INDEX".equals(objectType) || "INDEX PARTITION".equals(objectType) || "INDEX SUBPARTITION".equals(objectType))) {
+                                indexOwner = result.getString(2);
+                                indexName = result.getString(3);
+                            }
                             String identity = containerId + ":" + mapped;
                             local.add(identity);
                             candidates.add(identity);
                             resolvedObjects.put(row.mappingKey(), mapped);
+                            if (isExcludedTable(new TableId(config.getCatalogName(), result.getString(2), result.getString(3)), result.getString(6))) {
+                                excludedTableMappings.add(row.mappingKey());
+                            }
+                            if (matchedObject && !matchedDataObject) {
+                                objectIdFallbackMappings.add(row.mappingKey());
+                            }
                             diagnosticMappings.put(row.mappingKey(), "PARTIAL:" + candidates);
                             String matchedBy = matchedDataObject && matchedObject ? "DATA_OBJECT_ID_AND_OBJECT_ID"
                                     : matchedDataObject ? "DATA_OBJECT_ID" : "OBJECT_ID_FALLBACK";
@@ -417,7 +717,11 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
                     }
                     String evidence = "container=" + containerId + "=" + containerName + ", referenceType=" + row.referenceType()
                             + ", DATA_OBJ#=" + row.objectId + ", candidates=" + local + ", matches=" + matches;
+                    if (matches.size() == 1 && indexOwner != null) {
+                        evidence += ", indexTableCheck={" + resolveExcludedIndexTable(row, indexOwner, indexName) + "}";
+                    }
                     dictionaryChecks.add(evidence);
+                    dictionaryEvidence.put(row.mappingKey(), evidence);
                     LOGGER.info("LOGMINER_ROOT_DICTIONARY_OBJECT_CHECK recoveryId={}, {}, dictionarySession={}, rawRow={}",
                             recoveryId, evidence, dictionarySession, row);
                 }
@@ -795,22 +1099,45 @@ class LogMinerDictionaryRecovery implements AutoCloseable {
             scn = Scn.valueOf(result.getString("SCN"));
             code = result.getInt("OPERATION_CODE");
             objectId = result.getString("DATA_OBJ#");
-            csf = result.getInt("CSF");
+            int rawCsf = result.getInt("CSF");
+            csf = result.wasNull() ? -1 : rawCsf;
+            int status = result.getInt("STATUS");
+            status = result.wasNull() ? -1 : status;
+            int ssn = result.getInt("SSN");
+            ssn = result.wasNull() ? -1 : ssn;
             String xid = result.getString("XID_HEX");
             Timestamp timestamp = result.getTimestamp("CHANGE_TIME");
             event = LogMinerEventRow.fromValues(catalog, scn, null, code,
                     timestamp == null ? null : timestamp.toLocalDateTime().toInstant(ZoneOffset.UTC),
                     xid == null || xid.isEmpty() ? null : xid.toLowerCase(Locale.ROOT),
-                    null, null, null, null, null, false, result.getString("RS_ID"), result.getInt("STATUS"),
-                    result.getString("INFO"), result.getInt("SSN"), result.getInt("REDO_THREAD"));
+                    null, null, null, null, null, false, result.getString("RS_ID"), status,
+                    result.getString("INFO"), ssn, result.getInt("REDO_THREAD"));
         }
 
         boolean isDml() {
             return code == 1 || code == 2 || code == 3;
         }
 
+        boolean isObjectlessInternal() {
+            return code == 0 && (objectId == null || "0".equals(objectId));
+        }
+
+        boolean isRootBootstrapInternal() {
+            // SYS.OBJ$ confirms that object id 1 is the root bootstrap entry SYS._NEXT_OBJECT.
+            // It is not exposed by DBA_OBJECTS and cannot identify a captured table.
+            return code == 0 && "1".equals(objectId);
+        }
+
         String mappingKey() {
             return referenceType() + objectId;
+        }
+
+        String filteredValidationKey() {
+            String key = mappingKey() + ", xid=" + event.getTransactionId();
+            if (isObjectlessInternal()) {
+                return key + ", scn=" + scn + ", rsId=" + event.getRsId() + ", ssn=" + event.getSsn();
+            }
+            return key;
         }
 
         String referenceType() {

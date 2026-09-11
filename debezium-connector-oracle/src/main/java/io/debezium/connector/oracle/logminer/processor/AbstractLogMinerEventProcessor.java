@@ -397,16 +397,16 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
         }
         final Scn offsetBefore = offsetContext.getScn();
         final String commitBefore = offsetContext.getCommitScn().toString();
-        LOGGER.error("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId={}, triggerReason={}, partition={}, catalog={}, pdb={}, details={}, "
+        LOGGER.info("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId={}, triggerReason={}, partition={}, catalog={}, pdb={}, details={}, "
                 + "offsetBefore={}, commitBefore={}, activeTransactions={}, cachedEvents={}, diagnosticConnectionClosed=true, "
                 + "businessDmlDiscarded=false, transactionBoundariesPreserved=true",
                 recoveryId, trigger == null ? "ONLINE_ZERO_ROWS" : "ORA_01403", partition, getConfig().getCatalogName(), getConfig().getPdbName(), plan.audit.summary,
                 offsetBefore, commitBefore, getTransactionCache().size(), getTransactionCacheEventCount());
         for (String record : plan.audit.records) {
-            LOGGER.error("LOGMINER_SYS_REDO_RECORD recoveryId={}, phase=PREPARED, {}", recoveryId, record);
+            LOGGER.info("LOGMINER_SYS_REDO_RECORD recoveryId={}, phase=PREPARED, {}", recoveryId, record);
         }
         for (T transaction : getTransactionCache().values()) {
-            LOGGER.error("LOGMINER_SYS_REDO_TRANSACTION recoveryId={}, retainedTransaction={}", recoveryId, describeTransactionForDiagnostics(transaction));
+            LOGGER.info("LOGMINER_SYS_REDO_TRANSACTION recoveryId={}, retainedTransaction={}", recoveryId, describeTransactionForDiagnostics(transaction));
         }
         int handledBoundaries = 0;
         try {
@@ -420,13 +420,13 @@ public abstract class AbstractLogMinerEventProcessor<T extends AbstractTransacti
                     throw new InterruptedException("LogMiner stopped during metadata transaction boundary");
                 }
                 handledBoundaries++;
-                LOGGER.error("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId={}, scn={}, operation={}, xid={}, redoThread={}, "
+                LOGGER.info("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId={}, scn={}, operation={}, xid={}, redoThread={}, "
                         + "cachedBefore={}, commitScnAfter={}",
                         recoveryId, boundary.getScn(), boundary.getEventType(), boundary.getTransactionId(), boundary.getThread(),
                         cachedBefore, offsetContext.getCommitScn());
             }
             final Scn next = advanceVerifiedPlSqlOutputWindow(partition, startScn, plan.end, handledBoundaries);
-            LOGGER.error("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId={}, details={}, nextStartScn={}, offsetBefore={}, offsetAfter={}, "
+            LOGGER.info("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId={}, details={}, nextStartScn={}, offsetBefore={}, offsetAfter={}, "
                     + "commitBefore={}, commitAfter={}, handledBoundaries={}, activeTransactions={}, heartbeatEnqueued=true, "
                     + "durableCheckpointNotConfirmed=true",
                     recoveryId, plan.audit.summary, next, offsetBefore, offsetContext.getScn(), commitBefore,

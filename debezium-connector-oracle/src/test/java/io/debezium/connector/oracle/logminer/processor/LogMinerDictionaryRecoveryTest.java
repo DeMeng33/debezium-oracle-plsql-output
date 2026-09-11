@@ -23,9 +23,12 @@ import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
@@ -37,6 +40,8 @@ import io.debezium.DebeziumException;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.logminer.events.EventType;
+import io.debezium.relational.RelationalTableFilters;
+import io.debezium.relational.Tables.TableFilter;
 import io.debezium.junit.logging.LogInterceptor;
 
 public class LogMinerDictionaryRecoveryTest {
@@ -222,16 +227,396 @@ public class LogMinerDictionaryRecoveryTest {
     }
 
     @Test
+    public void shouldVerifyDeployedObjectlessInternalWithSameSysTransaction() throws Exception {
+        Database db = new Database(row(110, 0, "0"), row(111, 0, "347"), row(111, 0, "346"));
+        db.objects.put("347", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
+        db.objects.put("346", Collections.singletonList(object(1, "SYS", "SMON_SCN_TO_TIME_AUX_IDX", "346", "346", "INDEX")));
+        LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+        try {
+            LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+            assertThat(plan.replayOnline).isTrue();
+            assertThat(plan.emptyReplayRejection).isNull();
+            assertThat(db.dictionaryQueries).hasSize(2).contains("1:OBJECT_ID_OR_DATA#=347", "1:OBJECT_ID_OR_DATA#=346");
+            assertThat(db.dictionaryQueries.stream().anyMatch(query -> query.endsWith("#=0"))).isFalse();
+            assertThat(logs.containsMessage("NOT_APPLICABLE:INTERNAL_WITHOUT_OBJECT_REFERENCE")).isTrue();
+            assertThat(logs.containsMessage("associated with SYS transaction in filtered interval")).isTrue();
+            assertThat(logs.containsMessage("CTXSYS.DR$DBO")).isFalse();
+        }
+        finally {
+            logs.stop();
+        }
+    }
+
+    @Test
+    public void shouldRejectObjectlessInternalWithoutSameSysTransaction() throws Exception {
+        Database isolated = new Database(row(110, 0, "0"));
+        LogMinerDictionaryRecovery.Plan isolatedPlan = isolated.verify(100, 120);
+        assertThat(isolatedPlan.emptyReplayRejection).contains("objectless INTERNAL without a verified SYS transaction association");
+        assertThat(isolated.dictionaryQueries).isEmpty();
+
+        Map<Object, Object> objectless = row(110, 0, "0");
+        objectless.put("XID_HEX", "OTHER");
+        Database differentTransaction = new Database(objectless, row(111, 0, "347"));
+        differentTransaction.objects.put("347", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
+        assertThat(differentTransaction.verify(100, 120).emptyReplayRejection)
+                .contains("objectless INTERNAL without a verified SYS transaction association");
+
+        Map<Object, Object> invalidDuplicate = row(112, 0, "0");
+        invalidDuplicate.put("STATUS", 2);
+        Database duplicate = new Database(row(110, 0, "0"), invalidDuplicate, row(111, 0, "347"));
+        duplicate.objects.put("347", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
+        assertThat(duplicate.verify(100, 120).emptyReplayRejection)
+                .contains("objectless INTERNAL without a verified SYS transaction association").contains("status=2");
+    }
+
+    @Test
+    public void shouldFilterConfirmedNonCapturedDmlUsingObjectIdFallback() throws Exception {
+        Database db = new Database(row(101, 1, "157440"));
+        db.excludedTables.add("T_CAR_INFO_OUT_LAST");
+        db.objects.put("157440", Collections.singletonList(object(1, "C##XHKJ", "T_CAR_INFO_OUT_LAST", "157440", "181012", "TABLE")));
+        LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+        try {
+            LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+            assertThat(plan.replayOnline).isTrue();
+            assertThat(plan.emptyReplayRejection).isNull();
+            assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=157440");
+            assertThat(logs.containsMessage("captureDecision=EXCLUDED_NON_CAPTURED_TABLE")).isTrue();
+            assertThat(logs.containsErrorMessage("LOGMINER_DIAGNOSIS_FAILED")).isFalse();
+        }
+        finally {
+            logs.stop();
+        }
+    }
+
+    @Test
+    public void shouldKeepNonCapturedBoundaryDmlOutOfErrorAudit() throws Exception {
+        Database db = new Database(row(101, 1, "9876"), row(101, 1, "157440"));
+        db.excludedTables.add("T_CAR_INFO_OUT_LAST");
+        db.objects.put("157440", Collections.singletonList(object(1, "C##XHKJ", "T_CAR_INFO_OUT_LAST", "157440", "181012", "TABLE")));
+        LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+        try {
+            LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+            assertThat(plan.audit).isNotNull();
+            assertThat(plan.audit.records.toString()).doesNotContain("T_CAR_INFO_OUT_LAST");
+            assertThat(plan.audit.summary).contains("discardedSysDml=1");
+            assertThat(logs.containsMessage("LOGMINER_NON_CAPTURED_DML_FILTERED")).isTrue();
+            assertThat(logs.containsErrorMessage("T_CAR_INFO_OUT_LAST")).isFalse();
+        }
+        finally {
+            logs.stop();
+        }
+    }
+
+    @Test
+    public void shouldAcceptObjectlessInternalAtSysBoundaryOnlyWithSameTransaction() throws Exception {
+        Database db = new Database(row(101, 1, "9876"), row(101, 0, "0"));
+        LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+        assertThat(plan.end).isEqualTo(Scn.valueOf(101));
+        assertThat(plan.audit.records.get(1)).contains("IGNORE_NON_CAPTURED_OPERATION")
+                .contains("NOT_APPLICABLE:INTERNAL_WITHOUT_OBJECT_REFERENCE");
+    }
+
+    @Test
     public void shouldNotAdvanceUnknownOnlineDictionaryFailure() throws Exception {
         Database db = new Database(row(110, 1, "999"));
         db.failOnlineCount = true;
         try {
             db.verify(100, 120);
-            fail("Expected online completeness failure");
+            fail("Expected unresolved raw object rejection");
+        }
+        catch (DebeziumException e) {
+            assertThat(e.getMessage()).contains("unmapped or ambiguous");
+            assertThat(e.getSuppressed()).hasSize(1);
+            assertThat(((SQLException) e.getSuppressed()[0]).getErrorCode()).isEqualTo(20004);
+        }
+    }
+
+    @Test
+    public void shouldRecoverVerifiedMetadataAcrossDeployedRangeWhenOnlineCountFails() throws Exception {
+        // The production log supplies the range and count, not all 756 row contents.
+        // Use synthetic, explicitly mapped metadata to verify the conditional recovery.
+        List<Map<Object, Object>> rows = new ArrayList<>();
+        rows.add(row(235476226, 6, null));
+        rows.add(selectForUpdate(235476226));
+        for (int i = 0; i < 752; i++) {
+            Map<Object, Object> internal = row(235476227 + i / 44, 0, "344");
+            internal.put("SSN", i);
+            rows.add(internal);
+        }
+        rows.add(row(235476244, 7, null));
+        rows.add(row(235476244, 36, null));
+        Database db = new Database(rows.toArray(new Map[0]));
+        db.failOnlineCount = true;
+        db.objects.put("344", Collections.singletonList(object(1, "SYS", "PENDING_SUB_SESSIONS$")));
+        db.logFiles = Collections.singletonList(logFile("archive-36846", 0, 235476225, 235496112, 1, 36846));
+        LogMinerDictionaryRecovery.Plan plan = db.verify(235476225, 235476244);
+        assertThat(plan.end).isEqualTo(Scn.valueOf(235476244));
+        assertThat(plan.replayOnline).isFalse();
+        assertThat(plan.boundaries).hasSize(2);
+        assertThat(plan.boundaries.get(0).getEventType()).isEqualTo(EventType.COMMIT);
+        assertThat(plan.boundaries.get(1).getEventType()).isEqualTo(EventType.ROLLBACK);
+        assertThat(plan.audit.summary).contains("verificationMode=RAW_FILTERED_WINDOW").contains("rawWindowRows=756");
+        assertThat(db.starts).containsExactly("raw:235476226:235476244", "online:235476226:235476244", "online:235476226:235476244");
+        assertThat(db.diagnosticSessionAllocated).isFalse();
+    }
+
+    @Test
+    public void shouldFilterExcludedTableDmlWhenOnlineCountFails() throws Exception {
+        Database db = new Database(row(110, 1, "157440"), row(111, 7, null));
+        db.failOnlineCount = true;
+        db.excludedTables.add("T_CAR_INFO_OUT_LAST");
+        db.objects.put("157440", Collections.singletonList(object(1, "C##XHKJ", "T_CAR_INFO_OUT_LAST", "157440", "181012", "TABLE")));
+        LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+        assertThat(plan.boundaries).hasSize(1);
+        assertThat(plan.audit.records.toString()).doesNotContain("T_CAR_INFO_OUT_LAST");
+        assertThat(plan.audit.summary).contains("discardedSysDml=0");
+    }
+
+    @Test
+    public void shouldRejectCapturedDmlAnywhereInRawFilteredWindow() throws Exception {
+        for (int code : Arrays.asList(1, 2, 3)) {
+            Database db = new Database(row(101, 0, "344"), row(102, 7, null), row(119, code, "999"));
+            db.failOnlineCount = true;
+            db.objects.put("344", Collections.singletonList(object(1, "SYS", "PENDING_SUB_SESSIONS$")));
+            db.objects.put("999", Collections.singletonList(object(1, "APP", "CAPTURED_TABLE")));
+            expectUnsafe(db, "captured or unsupported object");
+            assertThat(db.starts).containsExactly("raw:101:120", "online:101:120");
+        }
+    }
+
+    @Test
+    public void shouldKeepRejectingUnsupportedOperationsWhenOnlineCountFails() throws Exception {
+        for (int code : Arrays.asList(5, 9, 10, 11, 29, 68, 70, 71, 255, 99)) {
+            Database db = new Database(row(101, 6, null), row(102, 7, null), row(119, code, "95420"));
+            db.failOnlineCount = true;
+            expectUnsafe(db, "unsupported operation");
+        }
+        Database sysDml = new Database(row(110, 1, "344"));
+        sysDml.failOnlineCount = true;
+        sysDml.objects.put("344", Collections.singletonList(object(1, "SYS", "PENDING_SUB_SESSIONS$")));
+        expectUnsafe(sysDml, "captured or unsupported object");
+    }
+
+    @Test
+    public void shouldValidateEveryRawFilteredRowAfterOnlineCountFailure() throws Exception {
+        for (int code : Arrays.asList(0, 1, 6, 7, 25, 36)) {
+            for (String field : Arrays.asList("XID_HEX", "CHANGE_TIME", "RS_ID", "SSN", "REDO_THREAD", "CSF", "STATUS")) {
+                Map<Object, Object> invalid = row(110, code, "999");
+                invalid.put(field, null);
+                Database db = new Database(row(110, code, "999"), invalid);
+                db.failOnlineCount = true;
+                db.excludedTables.add("EXCLUDED_TABLE");
+                db.objects.put("999", Collections.singletonList(object(1, code == 0 ? "SYS" : "APP", "EXCLUDED_TABLE")));
+                expectUnsafe(db, "incomplete or invalid raw filtered-window metadata");
+            }
+        }
+        Map<Object, Object> invalidCommit = row(110, 7, null);
+        invalidCommit.put("STATUS", 2);
+        Database db = new Database(invalidCommit);
+        db.failOnlineCount = true;
+        expectUnsafe(db, "incomplete transaction boundary");
+    }
+
+    @Test
+    public void shouldRequireSysAssociationForObjectlessRawFilteredInternal() throws Exception {
+        Database db = new Database(row(110, 0, "0"), row(111, 0, "344"));
+        db.failOnlineCount = true;
+        db.objects.put("344", Collections.singletonList(object(1, "SYS", "PENDING_SUB_SESSIONS$")));
+        assertThat(db.verify(100, 120).end).isEqualTo(Scn.valueOf(120));
+        Database isolated = new Database(row(110, 0, "0"));
+        isolated.failOnlineCount = true;
+        expectUnsafe(isolated, "without a verified SYS transaction association");
+    }
+
+    @Test
+    public void shouldRejectIncompleteSecondRawScanAfterOnlineCountFailure() throws Exception {
+        Database db = new Database(row(110, 6, null), row(111, 7, null));
+        db.failOnlineCount = true;
+        db.truncateSecondRawScan = true;
+        expectUnsafe(db, "Incomplete metadata range");
+        assertThat(db.dictionaryQueries).isEmpty();
+    }
+
+    @Test
+    public void shouldNotRecoverUnrelatedOnlineCountErrorOrSuccessfulCountMismatch() throws Exception {
+        Database db = new Database(row(110, 6, null));
+        db.failOnlineCount = true;
+        db.onlineCountErrorCode = 942;
+        try {
+            db.verify(100, 120);
+            fail("Expected original SQL failure");
         }
         catch (SQLException e) {
-            assertThat(e.getErrorCode()).isEqualTo(20004);
+            assertThat(e.getErrorCode()).isEqualTo(942);
         }
+        assertThat(db.rawScans).isEqualTo(1);
+        db = new Database(row(110, 6, null));
+        db.onlineCountAdjustment = 1;
+        expectUnsafe(db, "Online/raw LogMiner row count mismatch");
+        assertThat(db.rawScans).isEqualTo(1);
+    }
+
+    @Test
+    public void shouldKeepLobReminingDisabledAfterOnlineCountFailure() throws Exception {
+        Database db = new Database(row(110, 6, null));
+        db.failOnlineCount = true;
+        when(db.config.isLobEnabled()).thenReturn(true);
+        expectUnsafe(db, "does not support LOB");
+    }
+
+    @Test
+    public void shouldFilterIndexInternalByExcludedParentTableInAllRecoveryPaths() throws Exception {
+        for (int mode : Arrays.asList(0, 1, 2)) {
+            Database db = mode == 0 ? new Database(row(101, 1, "9876"), row(101, 0, "158559"), row(101, 7, null))
+                    : new Database(row(101, 0, "158559"));
+            db.failOnlineCount = mode == 2;
+            excludedIndex(db, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+            LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+            try {
+                LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+                assertThat(plan.emptyReplayRejection).isNull();
+                assertThat(plan.replayOnline).isEqualTo(mode == 1);
+                assertThat(plan.end).isEqualTo(Scn.valueOf(mode == 0 ? 101 : 120));
+                assertThat(plan.boundaries).hasSize(mode == 0 ? 1 : 0);
+                assertThat(db.indexQueries).containsExactly("C##XHKJ.OUT_LAST_CAR_ID_IDX");
+                assertThat(logs.containsMessage("LOGMINER_NON_CAPTURED_INDEX_FILTERED")).isTrue();
+                if (plan.audit != null) {
+                    assertThat(plan.audit.records.toString()).doesNotContain("OUT_LAST_CAR_ID_IDX");
+                }
+            }
+            finally {
+                logs.stop();
+            }
+        }
+    }
+
+    @Test
+    public void shouldNeverUseIndexNameAsTableFilterOrInferMissingParent() throws Exception {
+        for (boolean missingParent : Arrays.asList(false, true)) {
+            Database db = new Database(row(101, 1, "9876"), row(101, 0, "95991"));
+            excludedIndex(db, "95991", "IDX_QRTZ_FT_T_G", "QRTZ_FIRED_TRIGGERS");
+            db.excludedTables.clear();
+            db.excludedTables.add("IDX_QRTZ_FT_T_G");
+            if (missingParent) {
+                db.indexes.clear();
+            }
+            expectUnsafe(db, "captured or unsupported object");
+        }
+    }
+
+    @Test
+    public void shouldRejectAmbiguousIndexParentAndSpecialIndexTypes() throws Exception {
+        for (String type : Arrays.asList("DOMAIN", "IOT - TOP", "LOB", "CLUSTER", "BITMAP", "FUNCTION-BASED NORMAL")) {
+            Database db = new Database(row(101, 1, "9876"), row(101, 0, "95991"));
+            excludedIndex(db, "95991", "IDX_QRTZ_FT_T_G", "QRTZ_FIRED_TRIGGERS");
+            db.indexes.put("C##XHKJ.IDX_QRTZ_FT_T_G", Collections.singletonList(Database.values("C##XHKJ", "QRTZ_FIRED_TRIGGERS", type, "TABLE")));
+            expectUnsafe(db, "captured or unsupported object");
+        }
+        Database db = new Database(row(101, 1, "9876"), row(101, 0, "95991"));
+        excludedIndex(db, "95991", "IDX_QRTZ_FT_T_G", "QRTZ_FIRED_TRIGGERS");
+        db.indexes.put("C##XHKJ.IDX_QRTZ_FT_T_G", Arrays.asList(
+                Database.values("C##XHKJ", "QRTZ_FIRED_TRIGGERS", "NORMAL", "TABLE"),
+                Database.values("APP", "CAPTURED_TABLE", "NORMAL", "TABLE")));
+        expectUnsafe(db, "captured or unsupported object");
+    }
+
+    @Test
+    public void shouldKeepPhysicalIndexIdentityUnique() throws Exception {
+        Database db = new Database(row(101, 1, "9876"), row(101, 0, "95991"));
+        excludedIndex(db, "95991", "IDX_QRTZ_FT_T_G", "QRTZ_FIRED_TRIGGERS");
+        db.objects.put("95991", Arrays.asList(
+                object(1, "C##XHKJ", "IDX_QRTZ_FT_T_G", "95991", "95991", "INDEX"),
+                object(1, "C##XHKJ", "IDX_QRTZ_FT_T_G", "95992", "95991", "TABLE")));
+        expectUnsafe(db, "captured or unsupported object");
+        assertThat(db.indexQueries).isEmpty();
+    }
+
+    @Test
+    public void shouldFilterOrdinaryIndexPartitionsButNeverDmlOnIndexReference() throws Exception {
+        for (String type : Arrays.asList("INDEX", "INDEX PARTITION", "INDEX SUBPARTITION")) {
+            Database db = new Database(row(101, 1, "9876"), row(101, 0, "158559"));
+            excludedIndex(db, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+            db.objects.put("158559", Collections.singletonList(object(1, "C##XHKJ", "OUT_LAST_CAR_ID_IDX", "158559", "181010", type)));
+            assertThat(db.verify(100, 120).end).isEqualTo(Scn.valueOf(101));
+        }
+        Database dml = new Database(row(101, 1, "9876"), row(101, 1, "158559"));
+        excludedIndex(dml, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+        expectUnsafe(dml, "OBJECT_ID fallback is only allowed for an excluded non-system table");
+        assertThat(dml.indexQueries).isEmpty();
+    }
+
+    @Test
+    public void shouldValidateEveryExcludedIndexInternalEvenWhenObjectsAreDeduplicated() throws Exception {
+        for (String field : Arrays.asList("CSF", "SSN", "XID_HEX", "REDO_THREAD", "CHANGE_TIME", "RS_ID")) {
+            Map<Object, Object> invalid = row(101, 0, "158559");
+            invalid.put(field, null);
+            Database db = new Database(row(101, 0, "158559"), invalid);
+            excludedIndex(db, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+            assertThat(db.verify(100, 120).emptyReplayRejection).contains("incomplete excluded-index INTERNAL");
+            Database boundary = new Database(row(101, 1, "9876"), row(101, 0, "158559"), invalid);
+            excludedIndex(boundary, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+            expectUnsafe(boundary, "incomplete excluded-index INTERNAL");
+        }
+    }
+
+    @Test
+    public void shouldFilterVerifiedRootBootstrapInternalWithoutDictionaryLookup() throws Exception {
+        for (boolean onlineCountUnavailable : Arrays.asList(false, true)) {
+            Database db = new Database(row(101, 0, "1"));
+            db.failOnlineCount = onlineCountUnavailable;
+            LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+            try {
+                LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+                assertThat(plan.end).isEqualTo(Scn.valueOf(120));
+                assertThat(plan.replayOnline).isEqualTo(!onlineCountUnavailable);
+                assertThat(plan.emptyReplayRejection).isNull();
+                assertThat(db.dictionaryQueries).isEmpty();
+                assertThat(logs.containsMessage("LOGMINER_ROOT_BOOTSTRAP_INTERNAL_FILTERED")).isTrue();
+            }
+            finally {
+                logs.stop();
+            }
+        }
+    }
+
+    @Test
+    public void shouldRejectBootstrapObjectOneOutsideStrictInternalMetadataShape() throws Exception {
+        Database dml = new Database(row(101, 1, "1"));
+        dml.failOnlineCount = true;
+        expectUnsafe(dml, "unmapped or ambiguous DATA_OBJECT#=");
+
+        Map<Object, Object> statusTwo = row(101, 0, "1");
+        statusTwo.put("STATUS", 2);
+        Database invalidStatus = new Database(statusTwo);
+        invalidStatus.failOnlineCount = true;
+        expectUnsafe(invalidStatus, "incomplete root bootstrap INTERNAL metadata");
+
+        Map<Object, Object> missingRsId = row(101, 0, "1");
+        missingRsId.put("RS_ID", null);
+        Database incomplete = new Database(missingRsId);
+        incomplete.failOnlineCount = true;
+        expectUnsafe(incomplete, "incomplete or invalid raw filtered-window metadata");
+    }
+
+    @Test
+    public void shouldFailWhenIndexParentDictionaryCannotBeRead() throws Exception {
+        Database db = new Database(row(101, 1, "9876"), row(101, 0, "158559"), row(101, 7, null));
+        excludedIndex(db, "158559", "OUT_LAST_CAR_ID_IDX", "T_CAR_INFO_OUT_LAST");
+        db.failIndexDictionary = true;
+        try {
+            db.verify(100, 120);
+            fail("Expected index dictionary error");
+        }
+        catch (SQLException e) {
+            assertThat(e.getErrorCode()).isEqualTo(942);
+        }
+        assertThat(db.starts).containsExactly("raw:101:120");
+    }
+
+    static void excludedIndex(Database db, String reference, String indexName, String tableName) {
+        db.excludedTables.add(tableName);
+        db.objects.put(reference, Collections.singletonList(object(1, "C##XHKJ", indexName, reference, "181010", "INDEX")));
+        db.indexes.put("C##XHKJ." + indexName, Collections.singletonList(Database.values("C##XHKJ", tableName, "NORMAL", "TABLE")));
     }
 
     @Test
@@ -256,6 +641,119 @@ public class LogMinerDictionaryRecoveryTest {
         assertThat(plan.boundaries.get(0).getTransactionId()).isEqualTo("abcdef");
         assertThat(plan.boundaries.get(0).getThread()).isEqualTo(1);
         assertThat(plan.boundaries.get(1).getEventType()).isEqualTo(EventType.ROLLBACK);
+    }
+
+    @Test
+    public void shouldRecoverDeployedSelectForUpdateAtSmonBoundary() throws Exception {
+        Map<Object, Object> select = selectForUpdate(235476225);
+        select.put("XID_HEX", "0b000d0068800400");
+        select.put("RS_ID", " 0x008fee.0000000c.0010 ");
+        select.put("SSN", 0);
+        select.put("CHANGE_TIME", Timestamp.valueOf("2026-09-10 05:54:07"));
+        Database db = new Database(row(235476225, 1, "345"), select,
+                row(235476225, 7, null), row(235476225, 36, null), row(235476226, 3, "95420"));
+        db.knownObjectId = "345";
+        db.objects.put("345", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
+        db.logFiles = Collections.singletonList(logFile("archive-36846", 0, 235476225, 235496112, 1, 36846));
+        LogInterceptor logs = new LogInterceptor(LogMinerDictionaryRecovery.class);
+        try {
+            LogMinerDictionaryRecovery.Plan plan = db.verify(235476224, 235496111);
+            assertThat(plan.end).isEqualTo(Scn.valueOf(235476225));
+            assertThat(plan.replayOnline).isFalse();
+            assertThat(plan.boundaries).hasSize(2);
+            assertThat(plan.boundaries.get(0).getEventType()).isEqualTo(EventType.COMMIT);
+            assertThat(plan.boundaries.get(1).getEventType()).isEqualTo(EventType.ROLLBACK);
+            assertThat(plan.audit.summary).contains("discardedSysDml=1").contains("filteredSelectForUpdate=1");
+            assertThat(plan.audit.records.toString()).doesNotContain("operationCode=25");
+            assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=345");
+            assertThat(logs.containsMessage("LOGMINER_SELECT_FOR_UPDATE_FILTERED")).isTrue();
+        }
+        finally {
+            logs.stop();
+        }
+    }
+
+    @Test
+    public void shouldAllowFilteredSelectForUpdateWindowForBothRawStatuses() throws Exception {
+        for (int status : Arrays.asList(0, 2)) {
+            Map<Object, Object> select = selectForUpdate(110);
+            select.put("STATUS", status);
+            Database db = new Database(select);
+            LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
+            assertThat(plan.replayOnline).isTrue();
+            assertThat(plan.emptyReplayRejection).isNull();
+            assertThat(plan.boundaries).isEmpty();
+            assertThat(db.countModes).containsExactly("raw", "online");
+            assertThat(db.dictionaryQueries).isEmpty();
+        }
+    }
+
+    @Test
+    public void shouldRejectEveryIncompleteSelectForUpdateInBothRecoveryPaths() throws Exception {
+        Map<String, List<Object>> invalidFields = new LinkedHashMap<>();
+        invalidFields.put("STATUS", Arrays.asList(null, 5));
+        invalidFields.put("CSF", Arrays.asList(null, 1));
+        invalidFields.put("XID_HEX", Arrays.asList(null, ""));
+        invalidFields.put("REDO_THREAD", Arrays.asList(null, 0));
+        invalidFields.put("CHANGE_TIME", Collections.singletonList(null));
+        invalidFields.put("RS_ID", Arrays.asList(null, " "));
+        invalidFields.put("SSN", Arrays.asList(null, -1));
+        for (Map.Entry<String, List<Object>> field : invalidFields.entrySet()) {
+            for (Object value : field.getValue()) {
+                // Same SCN, object, XID and record identity: no representative row may hide
+                // an incomplete second record, including an unfinished SQL continuation.
+                Map<Object, Object> invalid = selectForUpdate(101);
+                invalid.put(field.getKey(), value);
+                Database boundary = new Database(row(101, 1, "9876"), selectForUpdate(101), invalid);
+                expectUnsafe(boundary, "incomplete or invalid SELECT_FOR_UPDATE");
+                Database filtered = new Database(selectForUpdate(101), invalid);
+                assertThat(filtered.verify(100, 120).emptyReplayRejection).isNotNull();
+            }
+        }
+    }
+
+    @Test
+    public void shouldStillRequireOnlineCommitAndRollbackAfterSelectForUpdate() throws Exception {
+        for (int code : Arrays.asList(7, 36)) {
+            Database db = new Database(selectForUpdate(110), row(110, code, null));
+            assertThat(db.verify(100, 120).emptyReplayRejection).contains("raw redo requires an online row");
+        }
+    }
+
+    @Test
+    public void shouldNotFilterCapturedDmlSharingSelectForUpdateObjectAndTransaction() throws Exception {
+        for (int code : Arrays.asList(1, 2, 3)) {
+            Database db = new Database(row(101, 1, "9876"), selectForUpdate(101), row(101, 7, null), row(101, code, "95420"));
+            db.objects.put("95420", Collections.singletonList(object(1, "APP", "CAPTURED_TABLE")));
+            expectUnsafe(db, "captured or unsupported object");
+            Database filtered = new Database(selectForUpdate(101), row(101, code, "95420"));
+            filtered.objects.put("95420", Collections.singletonList(object(1, "APP", "CAPTURED_TABLE")));
+            assertThat(filtered.verify(100, 120).emptyReplayRejection).contains("potentially captured or invalid operation");
+        }
+    }
+
+    @Test
+    public void shouldKeepRejectingDdlLobXmlAndUnknownOperationsAlongsideSelectForUpdate() throws Exception {
+        for (int code : Arrays.asList(5, 9, 10, 11, 29, 68, 70, 71, 255, 99)) {
+            Database db = new Database(row(101, 1, "9876"), selectForUpdate(101), row(101, code, "95420"));
+            expectUnsafe(db, "unsupported operation");
+            Database filtered = new Database(selectForUpdate(101), row(101, code, "95420"));
+            assertThat(filtered.verify(100, 120).emptyReplayRejection).contains("raw redo requires an online row");
+        }
+        expectUnsafe(new Database(row(101, 1, "9876"), selectForUpdate(101), row(101, 34, null)), "missing redo");
+    }
+
+    @Test
+    public void shouldNotUseSelectForUpdateAsSysEvidenceForObjectlessInternal() throws Exception {
+        Database db = new Database(selectForUpdate(110), row(110, 0, "0"));
+        assertThat(db.verify(100, 120).emptyReplayRejection).contains("without a verified SYS transaction association");
+    }
+
+    static Map<Object, Object> selectForUpdate(long scn) {
+        Map<Object, Object> select = row(scn, 25, "95420");
+        select.put("STATUS", 2);
+        select.put("INFO", "Dictionary Mismatch");
+        return select;
     }
 
     @Test
@@ -346,7 +844,7 @@ public class LogMinerDictionaryRecoveryTest {
         Database db = new Database(row(101, 1, "9876"));
         LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
         assertThat(plan.end).isEqualTo(Scn.valueOf(101));
-        assertThat(db.dictionaryQueries).containsExactly("1:DATA_OBJECT#=9876");
+        assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=9876");
         assertThat(plan.audit.summary).contains("scope=ROOT_ONLY").contains("pdbCapturedTables=NONE_CONFIRMED")
                 .contains("container=1=CDB$ROOT");
         assertThat(db.sql.stream().noneMatch(query -> query.startsWith("ALTER SESSION SET CONTAINER"))).isTrue();
@@ -361,7 +859,7 @@ public class LogMinerDictionaryRecoveryTest {
         LogMinerDictionaryRecovery.Plan plan = db.verify(234316223, 234338223);
         assertThat(plan.end).isEqualTo(Scn.valueOf(234316224));
         assertThat(plan.boundaries).hasSize(1);
-        assertThat(db.dictionaryQueries).containsExactly("1:DATA_OBJECT#=345");
+        assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=345");
         assertThat(plan.audit.summary).contains("DATA_OBJECT#=345=[1:SYS.SMON_SCN_TIME]").contains("crossContainerLookupSkipped");
     }
 
@@ -374,8 +872,8 @@ public class LogMinerDictionaryRecoveryTest {
         db.objects.put("347", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
         LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
         assertThat(plan.end).isEqualTo(Scn.valueOf(101));
-        assertThat(db.dictionaryQueries).containsExactly("1:DATA_OBJECT#=345", "1:INTERNAL_OBJECT_OR_DATA#=346",
-                "1:INTERNAL_OBJECT_OR_DATA#=347");
+        assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=345", "1:OBJECT_ID_OR_DATA#=346",
+                "1:OBJECT_ID_OR_DATA#=347");
         assertThat(plan.audit.summary).contains("INTERNAL_OBJECT_OR_DATA#=347=[1:SYS.SMON_SCN_TIME]")
                 .contains("matchedBy=OBJECT_ID_FALLBACK, OBJECT_ID=347, DATA_OBJECT_ID=345, OBJECT_TYPE=TABLE");
         assertThat(plan.audit.records.get(2)).contains("IGNORE_NON_CAPTURED_OPERATION").contains("SYS.SMON_SCN_TIME");
@@ -386,8 +884,8 @@ public class LogMinerDictionaryRecoveryTest {
         Database db = new Database(row(101, 2, "347"));
         db.knownObjectId = "347";
         db.objects.put("347", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
-        expectUnsafe(db, "unmapped or ambiguous DATA_OBJECT#=");
-        assertThat(db.dictionaryQueries).containsExactly("1:DATA_OBJECT#=347");
+        expectUnsafe(db, "OBJECT_ID fallback is only allowed for an excluded non-system table");
+        assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=347");
     }
 
     @Test
@@ -456,7 +954,7 @@ public class LogMinerDictionaryRecoveryTest {
         db.cdb = false;
         db.objects.put("9876", Collections.singletonList(object(0, "SYS", "SMON_SCN_TIME")));
         assertThat(db.verify(100, 120).end).isEqualTo(Scn.valueOf(101));
-        assertThat(db.dictionaryQueries).containsExactly("0:DATA_OBJECT#=9876");
+        assertThat(db.dictionaryQueries).containsExactly("0:OBJECT_ID_OR_DATA#=9876");
     }
 
     @Test
@@ -481,7 +979,7 @@ public class LogMinerDictionaryRecoveryTest {
         LogMinerDictionaryRecovery.Plan plan = db.verify(100, 120);
         assertThat(plan.replayOnline).isTrue();
         assertThat(plan.emptyReplayRejection).isNull();
-        assertThat(db.dictionaryQueries).containsExactly("1:DATA_OBJECT#=999");
+        assertThat(db.dictionaryQueries).containsExactly("1:OBJECT_ID_OR_DATA#=999");
     }
 
     @Test
@@ -576,6 +1074,7 @@ public class LogMinerDictionaryRecoveryTest {
         row.put("XID_HEX", "ABCDEF");
         row.put("RS_ID", "0x0001.0002.0003");
         row.put("SSN", 1);
+        row.put("CSF", 0);
         row.put("STATUS", code == 1 ? 2 : 0);
         row.put("INFO", code == 1 ? "Dictionary Mismatch" : null);
         row.put("CHANGE_TIME", Timestamp.valueOf("2026-09-08 01:00:00"));
@@ -618,6 +1117,9 @@ public class LogMinerDictionaryRecoveryTest {
         final OracleConnectorConfig config = mock(OracleConnectorConfig.class);
         final List<Map<Object, Object>> rows;
         final Map<String, List<Map<Object, Object>>> objects = new HashMap<>();
+        final Map<String, List<Map<Object, Object>>> indexes = new HashMap<>();
+        final List<String> indexQueries = new ArrayList<>();
+        boolean failIndexDictionary;
         final List<String> starts = new ArrayList<>();
         final List<String> addedFiles = new ArrayList<>();
         final List<String> countModes = new ArrayList<>();
@@ -633,12 +1135,18 @@ public class LogMinerDictionaryRecoveryTest {
         final List<String> sessionCalls = new ArrayList<>();
         final List<String> sql = new ArrayList<>();
         boolean failOnlineCount;
+        int onlineCountErrorCode = 20004;
+        int onlineCountAdjustment;
+        int rawScans;
+        boolean truncateSecondRawScan;
+        boolean failRestoreAfterCount;
         boolean failRestore;
         boolean cdb = true;
         String diagnosticContainerId = "1";
         String diagnosticContainerName = "CDB$ROOT";
         boolean failRootDictionary;
         final List<String> dictionaryQueries = new ArrayList<>();
+        final Set<String> excludedTables = new HashSet<>();
         int countAdjustment;
 
         @SafeVarargs
@@ -646,6 +1154,10 @@ public class LogMinerDictionaryRecoveryTest {
             this.rows = Arrays.asList(rows);
             when(config.getCatalogName()).thenReturn("ORCL");
             when(config.getLogMiningViewFetchSize()).thenReturn(1000);
+            RelationalTableFilters filters = mock(RelationalTableFilters.class);
+            TableFilter tableFilter = TableFilter.fromPredicate(tableId -> !excludedTables.contains(tableId.table()));
+            when(filters.dataCollectionFilter()).thenReturn(tableFilter);
+            when(config.getTableFilters()).thenReturn(filters);
             objects.put("9876", Collections.singletonList(object(1, "SYS", "SMON_SCN_TIME")));
             when(connection.prepareStatement(anyString())).thenAnswer(invocation -> query(invocation.getArgument(0), false));
             when(connection.prepareCall(anyString())).thenAnswer(invocation -> call(invocation.getArgument(0), false));
@@ -697,6 +1209,17 @@ public class LogMinerDictionaryRecoveryTest {
                         return result(Collections.singletonList(values(cdb ? diagnosticContainerId : "0",
                                 cdb ? diagnosticContainerName : "ORCL", "C##XHKJ", "ORCL", diagnostic ? "20" : "10")));
                     }
+                    if (sql.contains("FROM DBA_INDEXES")) {
+                        if (!diagnostic) {
+                            throw new AssertionError("Index parent dictionary must be read on B");
+                        }
+                        if (failIndexDictionary) {
+                            throw new SQLException("index dictionary privilege missing", "42000", 942);
+                        }
+                        String index = args.get(1) + "." + args.get(2);
+                        indexQueries.add(index);
+                        return result(indexes.getOrDefault(index, Collections.emptyList()));
+                    }
                     if (sql.contains("FROM DBA_OBJECTS o LEFT JOIN DBA_TABLES")) {
                         if (!diagnostic) {
                             throw new AssertionError("Root dictionary must be read on B");
@@ -704,7 +1227,7 @@ public class LogMinerDictionaryRecoveryTest {
                         if (failRootDictionary) {
                             throw new SQLException("root dictionary privilege missing", "42000", 942);
                         }
-                        String reference = "1".equals(args.get(2)) ? "INTERNAL_OBJECT_OR_DATA#=" : "DATA_OBJECT#=";
+                        String reference = "OBJECT_ID_OR_DATA#=";
                         dictionaryQueries.add((cdb ? diagnosticContainerId : "0") + ":" + reference + args.get(1));
                         List<Map<Object, Object>> matches = new ArrayList<>();
                         for (Map<Object, Object> stored : objects.getOrDefault(args.get(1), Collections.emptyList())) {
@@ -727,7 +1250,12 @@ public class LogMinerDictionaryRecoveryTest {
                         if (!diagnostic) {
                             throw new AssertionError("Raw metadata must be read on B");
                         }
-                        return result(inRange(args.get(1), args.get(2)));
+                        rawScans++;
+                        List<Map<Object, Object>> raw = inRange(args.get(1), args.get(2));
+                        if (truncateSecondRawScan && rawScans == 2) {
+                            raw = raw.subList(0, raw.size() - 1);
+                        }
+                        return result(raw);
                     }
                     throw new AssertionError("Unexpected query: " + sql);
                 }
@@ -774,20 +1302,20 @@ public class LogMinerDictionaryRecoveryTest {
                             throw new AssertionError("A must stay online; B must stay in raw mode");
                         }
                         starts.add((online ? "online" : "raw") + ":" + args.get(1) + ":" + args.get(2));
-                        if (online && failRestore) {
+                        if (online && (failRestore || (failRestoreAfterCount && countModes.contains("online")))) {
                             throw new SQLException("restore failed");
                         }
                     }
                     if (sql.contains("COUNT(*)")) {
                         countModes.add(diagnostic ? "raw" : "online");
                         if (!diagnostic && failOnlineCount) {
-                            throw new SQLException("NO_DATA_FOUND during completeness check", "", 20004);
+                            throw new SQLException("NO_DATA_FOUND during completeness check", "", onlineCountErrorCode);
                         }
                     }
                     return false;
                 }
                 if (method.equals("getBigDecimal")) {
-                    return BigDecimal.valueOf(inRange(args.get(2), args.get(3)).size() + countAdjustment);
+                    return BigDecimal.valueOf(inRange(args.get(2), args.get(3)).size() + countAdjustment + (diagnostic ? 0 : onlineCountAdjustment));
                 }
                 return org.mockito.Answers.RETURNS_DEFAULTS.answer(invocation);
             });

@@ -15,8 +15,10 @@ import java.sql.SQLException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
@@ -161,6 +163,152 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
     }
 
     @Test
+    public void shouldPreservePendingTransactionUntilCommitAfterSelectForUpdateBoundary() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
+                LogMinerDictionaryRecoveryTest.row(101, 1, "9876"), LogMinerDictionaryRecoveryTest.selectForUpdate(101));
+        configureOutput(db, new String[]{ "@END|120|complete" }, new String[]{ boundaryLine(110, 7), "", "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(101));
+            assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
+            processor.process(partition, Scn.valueOf(101), Scn.valueOf(120));
+            assertThat(processor.getTransactionCache()).isEmpty();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.valueOf(110));
+        }
+    }
+
+    @Test
+    public void shouldApplyCommitAtValidatedSelectForUpdateAndSysBoundary() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
+                LogMinerDictionaryRecoveryTest.row(101, 1, "9876"), LogMinerDictionaryRecoveryTest.selectForUpdate(101),
+                LogMinerDictionaryRecoveryTest.row(101, 7, null));
+        configureOutput(db, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(101));
+            assertThat(processor.getTransactionCache()).isEmpty();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.valueOf(101));
+            Mockito.verify(offsetContext).setScn(Scn.valueOf(101));
+        }
+    }
+
+    @Test
+    public void shouldNotApplyCommitBeforeInvalidSelectForUpdateAtSameScn() throws Exception {
+        Map<Object, Object> invalid = LogMinerDictionaryRecoveryTest.selectForUpdate(101);
+        invalid.put("CSF", 1);
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
+                LogMinerDictionaryRecoveryTest.row(101, 1, "9876"), LogMinerDictionaryRecoveryTest.row(101, 7, null), invalid);
+        configureOutput(db, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            try {
+                processor.process(partition, Scn.valueOf(100), Scn.valueOf(120));
+                org.junit.Assert.fail("Expected incomplete SELECT_FOR_UPDATE rejection");
+            }
+            catch (DebeziumException expected) {
+                assertThat(expected.getMessage()).contains("incomplete or invalid SELECT_FOR_UPDATE");
+            }
+            assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+            Mockito.verify(offsetContext, Mockito.never()).setScn(Mockito.any());
+            Mockito.verify(dispatcher, Mockito.never()).dispatchHeartbeatEvent(Mockito.any(), Mockito.any());
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
+        }
+    }
+
+    @Test
+    public void shouldApplyVerifiedRawCommitAfterOnlineCountFailure() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = rawFilteredDatabase(
+                LogMinerDictionaryRecoveryTest.row(110, 0, "344"), LogMinerDictionaryRecoveryTest.row(111, 7, null));
+        configureOutput(db, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(120));
+            assertThat(processor.getTransactionCache()).isEmpty();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.valueOf(111));
+            Mockito.verify(offsetContext).setScn(Scn.valueOf(120));
+            Mockito.verify(db.diagnosticConnection).close();
+        }
+    }
+
+    @Test
+    public void shouldRetainPendingTransactionsAcrossRawFilteredWindow() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = rawFilteredDatabase(LogMinerDictionaryRecoveryTest.row(110, 0, "344"));
+        configureOutput(db, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(120));
+            assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
+            Mockito.verify(offsetContext).setScn(Scn.valueOf(90));
+            Mockito.verify(offsetContext, Mockito.never()).setScn(Scn.valueOf(120));
+        }
+    }
+
+    @Test
+    public void shouldNotApplyRawCommitIfLaterBusinessDmlCannotBeRecovered() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = rawFilteredDatabase(
+                LogMinerDictionaryRecoveryTest.row(101, 0, "344"), LogMinerDictionaryRecoveryTest.row(102, 7, null),
+                LogMinerDictionaryRecoveryTest.row(119, 1, "999"));
+        db.objects.put("999", Collections.singletonList(LogMinerDictionaryRecoveryTest.object(1, "APP", "CAPTURED_TABLE")));
+        configureOutput(db, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            try {
+                processor.process(partition, Scn.valueOf(100), Scn.valueOf(120));
+                org.junit.Assert.fail("Expected later captured DML rejection");
+            }
+            catch (DebeziumException expected) {
+                assertThat(expected.getMessage()).contains("captured or unsupported object");
+            }
+            assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
+            Mockito.verify(offsetContext, Mockito.never()).setScn(Mockito.any());
+            Mockito.verify(dispatcher, Mockito.never()).dispatchHeartbeatEvent(Mockito.any(), Mockito.any());
+        }
+    }
+
+    @Test
+    public void shouldNotApplyRawWindowBeforeRestorationAndDiagnosticCleanupSucceed() throws Exception {
+        for (boolean failRestore : Arrays.asList(false, true)) {
+            LogMinerDictionaryRecoveryTest.Database db = rawFilteredDatabase(
+                    LogMinerDictionaryRecoveryTest.row(110, 0, "344"), LogMinerDictionaryRecoveryTest.row(111, 7, null));
+            db.failRestoreAfterCount = failRestore;
+            db.failDiagnosticEnd = !failRestore;
+            configureOutput(db, new String[]{ "@END|120|complete" });
+            try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+                processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+                processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+                try {
+                    processor.process(partition, Scn.valueOf(100), Scn.valueOf(120));
+                    org.junit.Assert.fail("Expected session failure before applying raw metadata");
+                }
+                catch (SQLException expected) {
+                    assertThat(expected.getMessage()).contains(failRestore ? "restore failed" : "diagnostic end failed");
+                }
+                assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+                assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
+                Mockito.verify(offsetContext, Mockito.never()).setScn(Mockito.any());
+                Mockito.verify(dispatcher, Mockito.never()).dispatchHeartbeatEvent(Mockito.any(), Mockito.any());
+            }
+        }
+    }
+
+    @SafeVarargs
+    private final LogMinerDictionaryRecoveryTest.Database rawFilteredDatabase(Map<Object, Object>... rows) throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(rows);
+        db.failOnlineCount = true;
+        db.objects.put("344", Collections.singletonList(LogMinerDictionaryRecoveryTest.object(1, "SYS", "PENDING_SUB_SESSIONS$")));
+        return db;
+    }
+
+    @Test
     public void shouldReplayCommitBeforeBadScnWithoutCrossingBadScn() throws Exception {
         LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
                 LogMinerDictionaryRecoveryTest.row(105, 7, null), LogMinerDictionaryRecoveryTest.row(110, 1, "9876"));
@@ -202,6 +350,7 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
     public void shouldNotApplyEarlierCommitIfBusinessDmlAppearsLaterAtSameBadScn() throws Exception {
         LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
                 LogMinerDictionaryRecoveryTest.row(101, 1, "9876"), LogMinerDictionaryRecoveryTest.row(101, 7, null),
+                LogMinerDictionaryRecoveryTest.selectForUpdate(101),
                 LogMinerDictionaryRecoveryTest.row(101, 3, "999"));
         configureOutput(db, new String[]{ "@END|120|complete" });
         try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
@@ -252,8 +401,27 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
     }
 
     @Test
+    public void shouldAdvanceFilteredZeroWindowWithAssociatedObjectlessInternal() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
+                LogMinerDictionaryRecoveryTest.row(110, 0, "0"), LogMinerDictionaryRecoveryTest.row(111, 0, "347"),
+                LogMinerDictionaryRecoveryTest.row(111, 0, "346"));
+        db.objects.put("347", Collections.singletonList(
+                LogMinerDictionaryRecoveryTest.object(1, "SYS", "SMON_SCN_TIME", "347", "345", "TABLE")));
+        db.objects.put("346", Collections.singletonList(
+                LogMinerDictionaryRecoveryTest.object(1, "SYS", "SMON_SCN_TO_TIME_AUX_IDX", "346", "346", "INDEX")));
+        configureOutput(db, new String[]{ "@END|120|complete" }, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(120));
+            assertThat(db.dictionaryQueries).hasSize(2);
+            assertThat(db.dictionaryQueries.stream().anyMatch(query -> query.endsWith("#=0"))).isFalse();
+            Mockito.verify(offsetContext).setScn(Scn.valueOf(120));
+        }
+    }
+
+    @Test
     public void shouldRejectRepeatedZeroOutputWhenRawRedoContainsCommit() throws Exception {
-        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(LogMinerDictionaryRecoveryTest.row(110, 7, null));
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(
+                LogMinerDictionaryRecoveryTest.selectForUpdate(110), LogMinerDictionaryRecoveryTest.row(110, 7, null));
         configureOutput(db, new String[]{ "@END|120|complete" }, new String[]{ "@END|120|complete" });
         try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
             try {
@@ -264,6 +432,23 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
                 assertThat(expected.getMessage()).contains("raw redo requires an online row");
             }
             Mockito.verify(offsetContext, Mockito.never()).setScn(Mockito.any());
+        }
+    }
+
+    @Test
+    public void shouldAdvanceSelectForUpdateOnlyWindowAfterOnlineReplay() throws Exception {
+        LogMinerDictionaryRecoveryTest.Database db = new LogMinerDictionaryRecoveryTest.Database(LogMinerDictionaryRecoveryTest.selectForUpdate(110));
+        PreparedStatement query = configureOutput(db, new String[]{ "@END|120|complete" }, new String[]{ "@END|120|complete" });
+        try (TestableMemoryLogMinerEventProcessor processor = plSqlProcessor()) {
+            processor.handleStart(getStartLogMinerEventRow(Scn.valueOf(90), "abcdef"));
+            processor.handleDataEvent(getInsertLogMinerEventRow(Scn.valueOf(91), "abcdef"));
+            assertThat(processor.process(partition, Scn.valueOf(100), Scn.valueOf(120))).isEqualTo(Scn.valueOf(120));
+            Mockito.verify(query, Mockito.times(2)).execute();
+            // The mining cursor can move on, but a restart must still replay the pending transaction.
+            Mockito.verify(offsetContext).setScn(Scn.valueOf(90));
+            Mockito.verify(offsetContext, Mockito.never()).setScn(Scn.valueOf(120));
+            assertThat(processor.getTransactionCache().get("abcdef")).isNotNull();
+            assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.NULL);
         }
     }
 
@@ -316,14 +501,17 @@ public class MemoryProcessorTest extends AbstractProcessorUnitTest<MemoryLogMine
             Mockito.verify(dispatcher).dispatchDataChangeEvent(Mockito.any(), Mockito.any(), Mockito.any());
             Mockito.verify(db.connection, Mockito.never()).close();
             assertThat(offsetContext.getCommitScn().getMaxCommittedScn()).isEqualTo(Scn.valueOf(101));
-            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId=")).isTrue();
-            assertThat(logs.containsErrorMessage("discardedSysDml=1")).isTrue();
-            assertThat(logs.containsErrorMessage("logFiles=[archive-a, archive-b]")).isTrue();
-            assertThat(logs.containsErrorMessage("action=DISCARD_CONFIRMED_SYS_DML")).isTrue();
-            assertThat(logs.containsErrorMessage("action=PRESERVE_TRANSACTION_BOUNDARY")).isTrue();
-            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId=")).isTrue();
-            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId=")).isTrue();
-            assertThat(logs.containsErrorMessage("durableCheckpointNotConfirmed=true")).isTrue();
+            assertThat(logs.containsMessage("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId=")).isTrue();
+            assertThat(logs.containsMessage("discardedSysDml=1")).isTrue();
+            assertThat(logs.containsMessage("logFiles=[archive-a, archive-b]")).isTrue();
+            assertThat(logs.containsMessage("action=DISCARD_CONFIRMED_SYS_DML")).isTrue();
+            assertThat(logs.containsMessage("action=PRESERVE_TRANSACTION_BOUNDARY")).isTrue();
+            assertThat(logs.containsMessage("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId=")).isTrue();
+            assertThat(logs.containsMessage("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId=")).isTrue();
+            assertThat(logs.containsMessage("durableCheckpointNotConfirmed=true")).isTrue();
+            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_DISCARD_PREPARED recoveryId=")).isFalse();
+            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_BOUNDARY_HANDLED recoveryId=")).isFalse();
+            assertThat(logs.containsErrorMessage("LOGMINER_SYS_REDO_DISCARD_COMPLETED recoveryId=")).isFalse();
         }
         finally {
             logs.stop();
